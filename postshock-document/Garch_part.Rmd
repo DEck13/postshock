@@ -1,0 +1,1263 @@
+---
+title: "GARCH_part"
+author: "Qiyang Wang"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+## import the dbw and QL loss function
+```{r, message=FALSE, warning=FALSE,echo=FALSE}
+### START QL_loss_function
+QL_loss_function <- function(pred, gt){gt/pred - log(gt/pred) - 1}
+### END QL_loss_function
+
+#We specify some functions for transforming y
+
+#mean_square_y will be used in garch models
+mean_square_y <- function(y){return((y-mean(y))**2)}
+
+#identity function will be used in synthetic prediction models
+id <- function(y){return(y)}
+
+```
+
+
+```{r, message=FALSE, warning=FALSE,echo=FALSE}
+# ------------------------------------------------------------------
+# dbw: Donor Balancing Weights
+# ------------------------------------------------------------------
+# Given target and donor feature matrices (as a list), compute weights
+# on donors so that a weighted donor vector best matches the target
+# vector under L1/L2 distance, using only rows up to each series'
+# shock time. Supports optional PCA, weight bounds, sum-to-one,
+# and L1/L2 regularization on weights.
+#
+# X:   list of data.frame/matrix. X[[1]] = target, X[[2..n+1]] = donors
+# dbw_indices: integer vector of columns to use in distance matching
+# shock_time_vec: integer vector of same length as X; we keep rows 1:shock_i
+# scale, center: logical; if TRUE, z-score/center features before matching
+# sum_to_1: logical; enforce sum(weights)=1
+# bounded_below_by, bounded_above_by: scalar numeric bounds for each weight
+# princ_comp_count: NULL or positive integer; do PCA before matching
+# normchoice: 'l1' or 'l2' distance between target and synthetic donor
+# penalty_normchoice: 'l1' (LASSO) or 'l2' (Ridge) on weights
+# penalty_lambda: >=0 regularization strength (0 disables penalty)
+# Y: optional list (same length as X) of auxiliary features to merge
+# Y_lookback_indices: integer backward indices for Y rows to include
+# X_lookback_indices: integer backward indices for X rows to include
+# inputted_transformation: function to transform Y before merge (default identity)
+#
+# Returns a list with:
+#   opt_params   numeric vector of donor weights (length = #donors)
+#   convergence  'convergence' or 'failed_convergence'
+#   loss         final matching loss (L1 or L2)
+# ------------------------------------------------------------------
+
+dbw <- function(
+  X,
+  dbw_indices,
+  shock_time_vec,
+  scale = FALSE,
+  center = FALSE,
+  sum_to_1 = TRUE,
+  bounded_below_by = 0,
+  bounded_above_by = 1,
+  princ_comp_count = NULL,
+  normchoice = 'l2',
+  penalty_normchoice = 'l1',
+  penalty_lambda = 0,
+  Y = NULL,
+  Y_lookback_indices = NULL,
+  X_lookback_indices = NULL,
+  inputted_transformation = base::identity
+) {
+  # ---- 0) basic checks -------------------------------------------------------
+  if (!normchoice %in% c("l1","l2"))
+    stop("normchoice must be 'l1' or 'l2'.")
+  if (!penalty_normchoice %in% c("l1","l2"))
+    stop("penalty_normchoice must be 'l1' or 'l2'.")
+  if (length(shock_time_vec) != length(X))
+    stop("length(shock_time_vec) must equal length(X).")
+  if (any(is.na(shock_time_vec)) || any(shock_time_vec < 1))
+    stop("shock_time_vec values must be integers >= 1 (no NA).")
+
+  # Check columns exist
+  for (i in seq_along(X)) {
+    if (ncol(X[[i]]) < max(dbw_indices)) {
+      stop(sprintf("X[[%d]] has only %d columns but dbw_indices=%s.",
+                   i, ncol(X[[i]]), paste(dbw_indices, collapse=",")))
+    }
+  }
+
+  # ---- 1) select columns -----------------------------------------------------
+  X_subset1 <- lapply(X, function(df) df[, dbw_indices, drop = FALSE])
+
+  # ---- 2) (optional) merge transformed Y lookbacks with X --------------------
+  if (!is.null(Y) && !is.null(Y_lookback_indices)) {
+    # helper: merge Y lookbacks (after transform) with X block
+    X_Y_combiner <- function(y, x) {
+      y_tr <- inputted_transformation(y)
+      # pick Y lookbacks (by backward indices) and flatten row-major
+      len_y <- nrow(y_tr)
+      idx_y <- len_y - as.numeric(unlist(Y_lookback_indices)) + 1
+      idx_y <- idx_y[idx_y >= 1 & idx_y <= len_y]
+      if (length(idx_y) == 0) stop("Y_lookback_indices out of range.")
+      y_vec <- as.numeric(t(as.matrix(y_tr[idx_y, , drop = FALSE])))
+      # bind Y vec (as 1-row matrix) before X block so they are used together
+      y_row <- matrix(y_vec, nrow = 1)
+      # recycle y_row to rows of x so cbind works
+      y_mat <- matrix(rep(y_vec, each = nrow(x)), nrow = nrow(x))
+      cbind(y_mat, x)
+    }
+    combined_X <- mapply(X_Y_combiner, y = Y, x = X_subset1, SIMPLIFY = FALSE)
+  } else {
+    combined_X <- X_subset1
+  }
+
+  # ---- 3) truncate to pre-shock rows ----------------------------------------
+  row_returner <- function(df, stv) {
+    stv <- min(nrow(df), as.integer(stv))
+    if (stv < 1L) stop("A shock_time < 1 was found.")
+    df[1:stv, , drop = FALSE]
+  }
+  X_subset2 <- mapply(row_returner, df = combined_X, stv = shock_time_vec, SIMPLIFY = FALSE)
+
+  # ---- 4) extract lookbacks -> single row per series -------------------------
+  cov_extractor <- function(X_df) {
+    # default: use last pre-shock row only
+    if (is.null(X_lookback_indices)) {
+      vals <- as.numeric(tail(X_df, 1))
+      matrix(vals, nrow = 1)
+    } else {
+      len <- nrow(X_df)
+      idx <- len - as.numeric(unlist(X_lookback_indices)) + 1
+      idx <- idx[idx >= 1 & idx <= len]
+      if (length(idx) == 0) stop("X_lookback_indices out of range after shock truncation.")
+      vals <- as.numeric(t(as.matrix(X_df[idx, , drop = FALSE]))) # flatten row-major
+      matrix(vals, nrow = 1)
+    }
+  }
+  X_rows <- lapply(X_subset2, cov_extractor)
+
+  # ---- 5) stack target + donors ---------------------------------------------
+  dat <- do.call('rbind', X_rows)    # first row = target, other rows = donors
+  if (nrow(dat) <= 1 || ncol(dat) == 0)
+    stop("Covariate matrix is empty or has no donors.")
+
+  # ---- 6) drop constant columns ---------------------------------------------
+  const_cols <- which(apply(dat, 2, function(x) sd(x, na.rm = TRUE) == 0))
+  if (length(const_cols) > 0) {
+    warning(sprintf("Removed constant columns: %s", paste(const_cols, collapse=",")))
+    dat <- dat[, -const_cols, drop = FALSE]
+    if (ncol(dat) == 0) stop("All columns were constant; nothing left to match.")
+  }
+
+  # ---- 7) optional centering/scaling ----------------------------------------
+  if (scale || center) {
+    dat <- base::scale(dat, center = center, scale = scale)
+    dat <- as.matrix(dat)
+  }
+
+  # ---- 8) sanity checks ------------------------------------------------------
+  if (any(is.na(dat)) || any(is.infinite(dat)))
+    stop("[dbw] Found NA/Inf after preprocessing.")
+  if (qr(dat)$rank < min(dim(dat)))
+    warning("Design matrix appears rank-deficient (collinearity). Consider PCA.")
+
+  # ---- 9) optional PCA -------------------------------------------------------
+  if (!is.null(princ_comp_count)) {
+    if (princ_comp_count <= 0) stop("princ_comp_count must be positive.")
+    if (ncol(dat) < princ_comp_count) stop("princ_comp_count exceeds number of features.")
+    if (ncol(dat) == 1) stop("PCA not meaningful with 1 column.")
+    sv <- svd(dat)
+    dat <- dat %*% sv$v[, 1:princ_comp_count, drop = FALSE]
+  }
+
+  # ---- 10) split target vs donors -------------------------------------------
+  X1 <- dat[1, , drop = FALSE]               # 1 x k target
+  donors <- dat[-1, , drop = FALSE]          # n x k donors
+  n <- nrow(donors)
+  if (n <= 0) stop("No donors available after preprocessing.")
+  X0 <- lapply(seq_len(n), function(i) donors[i, , drop = FALSE])
+
+  # ---- 11) objective: distance + optional penalty on W ----------------------
+  weightedX0 <- function(W) {
+    # convex combo of donor rows
+    XW <- Reduce(`+`, Map(function(w, x) w * as.matrix(x), W, X0))  # 1 x k
+    diff_vec <- as.numeric(X1 - XW)
+    loss <- if (normchoice == "l1") sum(abs(diff_vec)) else sqrt(sum(diff_vec^2))
+
+    if (penalty_lambda > 0) {
+      if (penalty_normchoice == 'l1') {
+        # NOTE: with simplex + non-negativity, sum(abs(W)) == 1 (constant) → no effect.
+        loss <- loss + penalty_lambda * sum(abs(W))
+      } else {
+        loss <- loss + penalty_lambda * sum(W^2)
+      }
+    }
+    loss
+  }
+
+  # ---- 12) constraints -------------------------------------------------------
+  eqfun_obj <- NULL; eqB_obj <- NULL
+  if (isTRUE(sum_to_1)) {         # enforce sum(W) = 1
+    eqfun_obj <- function(W) sum(W) - 1
+    eqB_obj   <- 0
+  }
+  LB <- if (!is.na(bounded_below_by)) rep(bounded_below_by, n) else NULL
+  UB <- if (!is.na(bounded_above_by)) rep(bounded_above_by, n) else NULL
+
+  # quick feasibility check for simplex box
+  if (isTRUE(sum_to_1) && !is.null(LB) && !is.null(UB)) {
+    if (sum(LB) > 1 + 1e-12 || sum(UB) < 1 - 1e-12)
+      stop("Infeasible constraints: cannot satisfy sum(W)=1 with given bounds.")
+  }
+
+  # ---- 13) solve -------------------------------------------------------------
+  opt <- Rsolnp::solnp(
+    par   = rep(1/n, n),                 # uniform start
+    fun   = weightedX0,
+    eqfun = eqfun_obj,
+    eqB   = eqB_obj,
+    LB    = LB,
+    UB    = UB,
+    control = list(trace = 1, tol = 1e-8)
+  )
+
+  # ---- 14) final loss & return ----------------------------------------------
+  syn <- opt$pars %*% donors
+  diff_vec <- as.numeric(X1 - syn)
+  final_loss <- if (normchoice == "l1") sum(abs(diff_vec)) else sqrt(sum(diff_vec^2))
+  list(
+    opt_params  = as.numeric(opt$pars),
+    convergence = if (opt$convergence == 0) "convergence" else "failed_convergence",
+    loss        = as.numeric(round(final_loss, 6))
+  )
+}
+
+
+```
+
+### Overview
+`dbw()` learns donor weights \(W\) so a **synthetic control** (weighted donors) matches the **target** on selected covariates **before the shock**.  
+Use for matching/balancing prior to effect estimation.
+
+### Arguments (most used)
+- `X`: list of data.frames. `X[[1]]` = target, `X[[2..]]` = donors. Rows=time, columns=covariates.
+- `dbw_indices`: integer vector of covariate columns to use (e.g., `1`, `1:3`).
+- `shock_time_vec`: integer vector (length = `length(X)`), last pre-shock row per unit.
+- `center`, `scale`: mean-center / standardize columns (recommended if scales differ).
+- `sum_to_1`, `bounded_below_by`, `bounded_above_by`: weight constraints (e.g., simplex: `sum_to_1=TRUE`, `0 ≤ W ≤ 1`).
+- `normchoice`: `'l1'` (Manhattan, robust) or `'l2'` (Euclidean) data loss.
+- `penalty_normchoice`, `penalty_lambda`: regularization on weights — `'l1'` = **LASSO**, `'l2'` = **Ridge**.  
+  *Note:* Under simplex (non-negative & sum=1), LASSO is constant → use **Ridge**.
+
+Optional: `princ_comp_count` (PCA), `Y`, `Y_lookback_indices`, `X_lookback_indices`, `inputted_transformation`.
+
+### Minimal Example
+```{r}
+set.seed(1)
+
+# Toy data: target + 2 donors, 3 covariates, T=50
+T  <- 50; K <- 3
+target <- data.frame(x1=rnorm(T), x2=rnorm(T, 0.2), x3=rnorm(T,-0.1))
+donor1 <- data.frame(x1=rnorm(T, 0.1), x2=rnorm(T,-0.1), x3=rnorm(T, 0.3))
+donor2 <- data.frame(x1=rnorm(T,-0.2), x2=rnorm(T, 0.4), x3=rnorm(T, 0.0))
+
+X_list <- list(target, donor1, donor2)
+shock  <- c(40, 40, 40)  # use rows 1..40 as pre-shock for all
+
+# Run dbw (assumes dbw() is loaded)
+res <- dbw(
+  X = X_list,
+  dbw_indices = 1:K,
+  shock_time_vec = shock,
+  center = TRUE, scale = TRUE,
+  sum_to_1 = TRUE, bounded_below_by = 0, bounded_above_by = 1,
+  normchoice = "l2",
+  penalty_normchoice = "l2", penalty_lambda = 1e-2  # Ridge recommended on simplex
+)
+
+res$opt_params    # donor weights
+res$loss          # final matching error
+res$convergence   # "convergence" or "failed_convergence"
+```
+
+
+## Auto.garch
+```{r, message=FALSE, warning=FALSE,echo=FALSE}
+# =============================================================================
+# auto_garchx
+# -----------------------------------------------------------------------------
+# Automatically select a GARCHX specification by grid-searching orders and
+# (optionally) refitting with a backcast initialized at the unconditional
+# variance. Works with the `garchx` package.
+#
+# Args:
+#   y            : numeric vector of returns/residuals (no NA/Inf/NaN).
+#   xreg         : optional matrix of exogenous regressors (same number of rows as y).
+#   max.p, max.q : nonnegative integers; AR (p) and MA (q) orders to search up to.
+#   search_o     : which asymmetry orders to consider; 0 = symmetric, 1 = GJR.
+#   final_refit  : if TRUE, refit best model using a “backcast” equal to the
+#                  unconditional variance (clamped to a reasonable range).
+#   clamp_factor : length-2 numeric vector c(low, high). If the computed
+#                  unconditional variance is outside [low, high] * var(y),
+#                  fallback to sample variance for the backcast.
+#   vcov.type    : 'ordinary' or 'robust' standard errors to use in estimation.
+#   verbose      : print progress/info/warnings.
+#
+# Returns:
+#   A list with elements:
+#     $fit       : the selected garchx fit object
+#     $p,$q,$o   : selected orders (note: garchx order = c(q, p, o))
+#     $bic,$aic  : information criteria of the selected fit
+#     $refit_used: TRUE/FALSE if the final backcast refit replaced the grid one
+#
+# Notes:
+#   * The `order` used by garchx is c(q, p, o) (MA, AR, asymmetry).
+#   * We skip the trivial (0,0,0) model.
+#   * If no model converges in the grid, we stop with an error.
+# =============================================================================
+auto_garchx <- function(
+  y,
+  xreg         = NULL,
+  max.p        = 3,
+  max.q        = 3,
+  search_o     = c(0L, 1L),      # 0 = symmetric, 1 = GJR
+  final_refit  = TRUE,
+  clamp_factor = c(0.1, 10),     # if backcast is outside [0.1, 10] * var(y), use var(y)
+  vcov.type    = c("ordinary","robust"),
+  verbose      = TRUE
+) {
+  vcov.type <- match.arg(vcov.type)
+
+  # ---- Basic input checks ----------------------------------------------------
+  stopifnot(is.numeric(y), is.vector(y))
+  if (any(!is.finite(y))) stop("auto_garchx: 'y' contains NA/Inf/NaN.")
+  n <- length(y)
+  if (n < 20 && verbose) warning("auto_garchx: very short series; estimation may be unstable.")
+
+  if (!is.null(xreg)) {
+    xreg <- as.matrix(xreg)
+    if (nrow(xreg) != n) stop("auto_garchx: nrow(xreg) must equal length(y).")
+    if (any(!is.finite(xreg))) stop("auto_garchx: 'xreg' contains NA/Inf/NaN.")
+  }
+
+  # Normalize search list for o (0 or 1 only)
+  search_o <- as.integer(unique(search_o))
+  search_o <- search_o[search_o %in% c(0L,1L)]
+  if (!length(search_o)) search_o <- 0L
+
+  # Holder for the best model by BIC
+  best <- list(bic = Inf, aic = Inf, fit = NULL,
+               p = NA_integer_, o = NA_integer_, q = NA_integer_)
+
+  # ---- 1) Grid search over (q, p, o) ----------------------------------------
+  # NOTE: garchx::garchx(order = c(q, p, o))
+  for (q in 0:max.q) {
+    for (p in 0:max.p) {
+      for (o in search_o) {
+        # skip the trivial model
+        if (p == 0L && q == 0L && o == 0L) next
+
+        fit0 <- try(
+          garchx::garchx(y = y, order = c(q, p, o), xreg = xreg, vcov.type = vcov.type),
+          silent = TRUE
+        )
+        if (inherits(fit0, "try-error")) next
+
+        ll   <- as.numeric(logLik(fit0))
+        k    <- length(coef(fit0))
+        bic0 <- -2 * ll + k * log(n)
+        aic0 <- -2 * ll + 2 * k
+
+        if (is.finite(bic0) && bic0 < best$bic) {
+          best <- list(bic = bic0, aic = aic0, fit = fit0, p = p, o = o, q = q)
+        }
+      }
+    }
+  }
+  if (is.null(best$fit)) stop("auto_garchx: no converged model in grid search.")
+
+  # If we don’t want the refit step, return the grid winner
+  if (!isTRUE(final_refit)) return(best)
+
+  # ---- 2) Refit using a backcast at unconditional variance ------------------
+  # Extract coefficients from the grid winner to compute unconditional variance
+  cf     <- coef(best$fit)
+  om.idx <- grep("^(intercept|omega)$", names(cf), ignore.case = TRUE)
+  if (!length(om.idx)) return(best)  # if we cannot detect omega, give up refit
+
+  omega  <- as.numeric(cf[om.idx[1]])
+  alpha  <- sum(cf[grep("^arch",  names(cf), ignore.case = TRUE)], na.rm = TRUE)
+  beta   <- sum(cf[grep("^garch", names(cf), ignore.case = TRUE)], na.rm = TRUE)
+  gamma  <- if (best$o == 1L) sum(cf[grep("asym|gamma|gjr", names(cf), ignore.case = TRUE)], na.rm = TRUE) else 0
+
+  # Unconditional variance for GJR: omega / (1 - alpha - beta - 0.5*gamma)
+  denom  <- 1 - alpha - beta - 0.5 * gamma
+  if (!is.finite(omega) || denom <= 0) return(best)  # no valid refit
+
+  uncond_var <- as.numeric(omega / denom)
+
+  # Clamp to a reasonable range relative to sample variance to avoid extreme backcasts
+  sv  <- stats::var(y, na.rm = TRUE)
+  rng <- range(clamp_factor)
+  if (!is.finite(uncond_var) || uncond_var <= 0 ||
+      uncond_var < rng[1] * sv || uncond_var > rng[2] * sv) {
+    if (verbose) warning("[auto_garchx] backcast out of range; fallback to sample variance.")
+    uncond_var <- sv
+  }
+  if (verbose) {
+    message(sprintf("[auto_garchx] refit with backcast=%.6f (q=%d,p=%d,o=%d)",
+                    uncond_var, best$q, best$p, best$o))
+  }
+
+  # Refit with backcast.values set to a single numeric (not a list)
+  fit2 <- try(
+    garchx::garchx(
+      y = y,
+      order = c(best$q, best$p, best$o),
+      xreg  = xreg,
+      backcast.values = uncond_var,
+      vcov.type = vcov.type
+    ),
+    silent = TRUE
+  )
+
+  # If refit succeeded, keep it only if BIC improves; otherwise keep grid winner
+  if (!inherits(fit2, "try-error")) {
+    ll2  <- as.numeric(logLik(fit2))
+    k2   <- length(coef(fit2))
+    bic2 <- -2 * ll2 + k2 * log(n)
+    aic2 <- -2 * ll2 + 2 * k2
+
+    if (is.finite(bic2) && bic2 < best$bic) {
+      best$fit        <- fit2
+      best$bic        <- bic2
+      best$aic        <- aic2
+      best$refit_used <- TRUE
+    } else {
+      best$refit_used <- FALSE
+      if (verbose) warning("[auto_garchx] refit did not improve BIC; keeping grid-search model.")
+    }
+  } else if (verbose) {
+    warning("[auto_garchx] backcast-refit failed; keeping grid-search model.")
+  }
+
+  best
+}
+
+# A short alias if you prefer shorter name
+auto_garch <- auto_garchx
+
+```
+
+##test for auto
+```{r, message=FALSE, warning=FALSE,echo=FALSE}
+# --- Dependencies -------------------------------------------------------------
+library(garchx)
+
+# --- 1) Simulate an sGARCH(1,1) series --------------------------------------
+# We generate y_t = sigma_t * eps_t, with
+#   sigma_t^2 = omega + alpha * y_{t-1}^2 + beta * sigma_{t-1}^2
+# Choice of parameters (omega, alpha, beta) ensures stationarity (alpha + beta < 1).
+set.seed(123)
+n      <- 2000
+omega  <- 0.05
+alpha  <- 0.07
+beta   <- 0.90
+stopifnot(alpha + beta < 1)          # stationarity check
+
+eps    <- rnorm(n)
+sigma2 <- numeric(n)
+y      <- numeric(n)
+
+# Initialize with the unconditional variance for faster stabilization.
+sigma2[1] <- omega / (1 - alpha - beta)
+y[1]      <- sqrt(sigma2[1]) * eps[1]
+
+for (t in 2:n) {
+  sigma2[t] <- omega + alpha * y[t-1]^2 + beta * sigma2[t-1]
+  y[t]      <- sqrt(sigma2[t]) * eps[t]
+}
+
+# --- 2) Run your auto_garchx order selection ---------------------------------
+# search_o = c(0L,1L) means: try symmetric GARCH (o=0) and GJR-GARCH (o=1).
+# final_refit = TRUE triggers a refit using a backcast set to the unconditional variance
+# (clamped to a reasonable range), which often improves BIC stability.
+best <- auto_garchx(
+  y,
+  max.p       = 3,
+  max.q       = 3,
+  search_o    = c(0L, 1L),
+  final_refit = TRUE,
+  vcov.type   = "robust",   # robust (sandwich) covariance for standard errors
+  verbose     = TRUE
+)
+
+# --- 3) Inspect the selected specification and estimates ---------------------
+# NOTE: garchx uses order = c(q, p, o) internally; the helper returns p, q, o separately.
+best$p; best$q; best$o            # Expect something close to p=1, q=1, o=0 for this DGP
+best$bic; best$aic                # Information criteria of the selected fit
+
+# Model coefficients (intercept/omega, ARCH terms, GARCH terms, and possibly asymmetry)
+coef(best$fit)
+
+# Conditional variance and standard deviation (first few values)
+head(fitted(best$fit))            # sigma_t^2
+head(sqrt(fitted(best$fit)))      # sigma_t
+
+# Model residuals (innovations)
+head(residuals(best$fit))
+
+# --- 4) Variance forecasts ----------------------------------------------------
+# Predict conditional variance k steps ahead (returns a numeric vector).
+predict(best$fit, n.ahead = 5)
+
+```
+
+```{r, message=FALSE, warning=FALSE,echo=FALSE}
+library(garchx)
+
+## 1) Data generator: GJR-GARCH(1,1) -----------------------------------------
+# Recursion:
+#   h_t = ω + α ε_{t-1}^2 + γ * 1{ε_{t-1}<0} * ε_{t-1}^2 + β h_{t-1}
+#   ε_t = sqrt(h_t) * z_t ,  z_t ~ N(0,1)
+# Returns both the simulated returns y and the true conditional variance h_true.
+sim_gjr <- function(n = 3000, burnin = 800,
+                    omega = 0.02, alpha = 0.07, beta = 0.80, gamma = 0.25) {
+  # Stationarity check for GJR: alpha + beta + 0.5*gamma < 1
+  stopifnot(alpha + beta + 0.5 * gamma < 1)
+
+  N <- n + burnin                     # simulate extra for burn-in stabilization
+  z <- rnorm(N)                       # i.i.d. standard normal shocks
+  e <- numeric(N)                     # returns/innovations (ε_t)
+  h <- numeric(N)                     # conditional variance (h_t)
+
+  # Initialize at the unconditional variance (fast stabilization)
+  h[1] <- omega / (1 - alpha - beta - 0.5 * gamma)
+  e[1] <- sqrt(h[1]) * z[1]
+
+  # Forward recursion
+  for (t in 2:N) {
+    Ineg <- as.numeric(e[t - 1] < 0)  # indicator for negative shock (GJR term)
+    h[t] <- omega +
+      alpha * e[t - 1]^2 +
+      gamma * Ineg * e[t - 1]^2 +
+      beta  * h[t - 1]
+    e[t] <- sqrt(h[t]) * z[t]
+  }
+
+  # Drop burn-in and return last n points
+  list(y = tail(e, n), h_true = tail(h, n))
+}
+
+## 2) One run with fixed seed; full order search (max.p = max.q = 3) ----------
+set.seed(4242)
+sim   <- sim_gjr(n = 3000, omega = 0.02, alpha = 0.07, beta = 0.80, gamma = 0.25)
+y     <- sim$y
+vtrue <- sim$h_true                        # ground-truth conditional variance
+
+# Automatic model selection using your helper:
+# - tries a grid over p in [0..max.p], q in [0..max.q], o in {0 (sGARCH), 1 (GJR)}
+# - picks the best by BIC, then optionally refits with a backcast heuristic
+best <- auto_garchx(
+  y          = y,
+  max.p      = 3,
+  max.q      = 3,               # fairly small grid; expand if needed
+  search_o   = c(0L, 1L),       # allow symmetric (o=0) and GJR (o=1)
+  final_refit = TRUE,           # refit with backcast for stability
+  vcov.type  = "robust",        # robust (sandwich) covariance for SEs
+  verbose    = TRUE
+)
+
+cat(sprintf("\nSelected (q,p,o) = (%d,%d,%d)\n", best$q, best$p, best$o))
+print(coef(best$fit))
+
+## 3) Extract fitted conditional variance and compare to truth -----------------
+# garchx::fitted() may return a vector or a matrix; select the variance column.
+ff <- fitted(best$fit)
+
+vhat <- as.numeric(
+  if (is.matrix(ff)) {
+    cn  <- tolower(colnames(ff))
+    idx <- which(cn %in% c("sigma2", "variance", "var", "h", "cond.h", "condh"))
+    if (length(idx)) ff[, idx[1]] else ff[, ncol(ff)]  # fallback to last column
+  } else ff
+)
+
+# Compare over the overlapping tail (e.g., last 100 points).
+# If series are shorter than 100, fall back to the minimum available length.
+L <- min(100, length(vhat), length(vtrue))
+vhat_L  <- tail(vhat,  L)
+vtrue_L <- tail(vtrue, L)
+
+# Simple diagnostics: MSE and correlation between fitted and true variance
+mse  <- mean((vhat_L - vtrue_L)^2)
+corr <- cor(vhat_L, vtrue_L)
+cat(sprintf("Last-%d  MSE = %.6f | Corr = %.3f\n", L, mse, corr))
+
+# Visualization: ground-truth vs fitted conditional variance on the tail window
+plot(vtrue_L, type = "l", lwd = 1.6, col = "blue",
+     main = sprintf("True vs Fitted variance (last %d)", L),
+     xlab = "t (tail)", ylab = "variance")
+lines(vhat_L,  lwd = 1.2, col = "red")
+legend("topright", c("true", "fitted"), lty = 1, lwd = c(1.6, 1.2),
+       col = c("blue", "red"), bty = "n")
+
+```
+
+
+## GARCH_part
+```{r, message=FALSE, warning=FALSE,echo=FALSE}
+SynthVolForecast <- function(
+  Y_series_list,              # list of numeric vectors: [[1]] = target, [[2..n]] = donors
+  covariates_series_list,     # list of data.frames/matrices for donors' covariates (length = n_donors)
+  target_covariates,          # data.frame/matrix for target covariates (same columns as donors)
+  shock_time_vec,             # integer vector: shock row per series (length = length(Y_series_list))
+  shock_length_vec,           # integer vector: how long the indicator=1 lasts after shock (per series)
+  k = 1,                      # forecast horizon (steps after t0)
+  dbw_scale = TRUE,           # DBW: standardize columns
+  dbw_center = TRUE,          # DBW: center columns
+  dbw_indices = NULL,         # DBW: which columns to use (default = all)
+  princ_comp_input = NULL,    # DBW: optional dimension reduction (unused here, but kept)
+  covariate_indices = NULL,   # GARCH-X: which covariate columns are allowed into GARCH (NULL = none)
+  penalty_lambda = 0,         # DBW: penalty strength (0 = none)
+  penalty_normchoice = "l1",  # DBW: "l1" (lasso under simplex is constant) or "l2" (ridge)
+  plots = TRUE,               # whether to call plot_maker_garch (if it exists)
+  ground_truth_vec = NULL,    # optional truth for loss (QLIKE)
+  shock_time_labels = NULL,   # optional labels for plotting
+  return_fits = FALSE,        # return full fit objects for debugging
+  garch_order      = NULL,    # fixed order c(q,p,o); NULL = auto with auto_garchx
+  max.p            = 3,       # auto search: max AR lag in variance
+  max.q            = 3,       # auto search: max MA lag in variance
+  backcast.initial = NULL,    # fixed-order only: numeric backcast for garchx (NULL lets garchx choose)
+  vcov.type        = "robust" # covariance type for garchx & coeftest: "ordinary" or "robust"
+) {
+  # -- sanitize horizon and vcov.type -------------------------------------------------------------
+  k  <- max(1L, as.integer(k))
+  vc <- match.arg(tolower(as.character(vcov.type)), c("ordinary","robust"))
+
+  # -- basic sizes --------------------------------------------------------------------------------
+  n_total  <- length(Y_series_list)
+  n_donors <- n_total - 1L
+
+  # -- light argument checks ----------------------------------------------------------------------
+  if (!vc %in% c("ordinary","robust")) stop("vcov.type must be 'ordinary' or 'robust'.")
+  if (!is.null(backcast.initial)) {
+    stopifnot(is.numeric(backcast.initial), length(backcast.initial) == 1,
+              is.finite(backcast.initial), backcast.initial > 0)
+  }
+
+  # ============ FAST PATH: no donors (plain pre-shock GARCH on target) ===========================
+  if (n_donors == 0L) {
+    target_Y   <- Y_series_list[[1L]]
+    target_end <- as.integer(shock_time_vec[1L])          # fit only up to t0
+
+    # xreg for target GARCH-X (only if covariate_indices is provided)
+    target_xreg <- if (is.null(covariate_indices)) NULL else
+      as.matrix(target_covariates[1:target_end, covariate_indices, drop = FALSE])
+
+    # auto vs fixed order for target
+    if (is.null(garch_order)) {
+      sel_t <- auto_garchx(
+        y = target_Y[1:target_end], xreg = target_xreg,
+        max.p = max.p, max.q = max.q,
+        vcov.type = vc
+      )
+      target_order <- c(sel_t$q, sel_t$p, sel_t$o)        # keep (q,p,o) convention
+      fit_target   <- sel_t$fit
+    } else {
+      target_order <- garch_order
+      fit_target   <- garchx::garchx(
+        y = target_Y[1:target_end],
+        order = target_order,
+        xreg  = target_xreg,
+        vcov.type = vc,
+        backcast.values = if (is.null(backcast.initial)) NULL else backcast.initial
+      )
+    }
+
+    # k-step variance forecast (list or numeric depending on garchx version)
+    raw_pred <- predict(fit_target, n.ahead = k)
+    raw_vec  <- as.numeric(if (is.list(raw_pred)) raw_pred$pred else raw_pred)
+
+    # return 3 identical vectors; there's no donor correction
+    return(list(
+      linear_combinations = numeric(0),
+      predictions = list(
+        unadjusted      = raw_vec,
+        adjusted        = raw_vec,
+        arithmetic_mean = raw_vec
+      ),
+      meta = list(
+        n_donors       = 0L,
+        weights        = numeric(0),
+        omega_vec      = numeric(0),
+        omega_se       = numeric(0),
+        combined_omega = 0,
+        shock_time     = shock_time_vec,
+        shock_length   = shock_length_vec,
+        target_order   = target_order
+      ),
+      target_fit = fit_target
+    ))
+  }
+  # ===================== END FAST PATH ===========================================================
+
+  # -- dimensionality checks for donor path -------------------------------------------------------
+  stopifnot(length(shock_time_vec)   == n_total)
+  stopifnot(length(shock_length_vec) == n_total)
+  stopifnot(length(covariates_series_list) == n_donors)
+
+  # -- helper: coerce to data.frame ---------------------------------------------------------------
+  as_df <- function(x) {
+    if (is.numeric(x)) data.frame(V1 = x)
+    else if (is.matrix(x)) as.data.frame(x)
+    else if (inherits(x, "data.frame")) x
+    else stop("covariates must be numeric/matrix/data.frame")
+  }
+
+  # target + each donor covariate block → data.frame
+  target_covariates <- as_df(target_covariates)
+  for (i in seq_len(n_donors)) {
+    covariates_series_list[[i]] <- as_df(covariates_series_list[[i]])
+  }
+
+  # defaults for DBW inputs
+  if (is.null(dbw_indices))    dbw_indices    <- 1:ncol(target_covariates)
+  if (is.null(princ_comp_input)) princ_comp_input <- min(length(shock_time_vec),
+                                                         ncol(target_covariates))
+
+  # define QLIKE if not present
+  if (!exists("QL_loss_function", mode = "function")) {
+    QL_loss_function <- function(vhat, y) log(vhat) + (y^2)/vhat
+  }
+  has_lmtest <- requireNamespace("lmtest", quietly = TRUE)
+
+  # ========================= PER-DONOR: GARCH-X & post-shock effect =============================
+  omega_star_hat_vec     <- numeric(n_donors)       # estimated post-shock jump per donor
+  omega_star_std_err_vec <- rep(NA_real_, n_donors) # std.err if available
+  donor_fits             <- vector("list", n_donors)
+  donor_selected_orders  <- vector("list", n_donors)
+
+  for (i in seq_len(n_donors)) {
+    donor_Y <- Y_series_list[[i+1L]]
+    donor_X <- covariates_series_list[[i]]
+
+    # build post-shock indicator for this donor:
+    # [t0+1, t0+len] is 1; 0 otherwise. For persistent level shift, len should run to series end.
+    len_i   <- as.integer(shock_length_vec[i+1L])
+    start_i <- as.integer(shock_time_vec[i+1L])
+    end_i   <- min(start_i + len_i, length(donor_Y))
+    post_shock_indicator <- rep(0L, length(donor_Y))
+    if (len_i > 0L && end_i >= start_i + 1L) {
+      post_shock_indicator[(start_i+1L):end_i] <- 1L
+    }
+
+    # donor regressors for GARCH-X: either just the indicator, or (selected covariates + indicator)
+    rows_to_use <- length(donor_Y)
+    if (is.null(covariate_indices)) {
+      X_i_final <- matrix(post_shock_indicator[1:rows_to_use], ncol = 1,
+                          dimnames = list(NULL, "post_shock_indicator"))
+    } else {
+      X_cov     <- as.matrix(donor_X[1:rows_to_use, covariate_indices, drop = FALSE])
+      X_i_final <- cbind(X_cov, post_shock_indicator[1:rows_to_use])
+      colnames(X_i_final)[ncol(X_i_final)] <- "post_shock_indicator"
+    }
+
+    cat(sprintf("Donor %d: Y rows=%d, X rows=%d\n", i, length(donor_Y), nrow(X_i_final)))
+
+    # fit donor model (auto vs fixed order)
+    if (is.null(garch_order)) {
+      sel <- auto_garchx(
+        y     = donor_Y[1:rows_to_use],
+        xreg  = X_i_final,
+        max.p = max.p,
+        max.q = max.q,
+        vcov.type = vc
+      )
+      order_i   <- c(sel$q, sel$p, sel$o)  # keep (q,p,o)
+      donor_fit <- sel$fit
+      cat(sprintf("  auto-selected order=(%d,%d,%d)  BIC=%.2f\n", sel$q, sel$p, sel$o, sel$bic))
+    } else {
+      order_i   <- garch_order
+      donor_fit <- garchx::garchx(
+        y = donor_Y[1:rows_to_use],
+        order = order_i,
+        xreg  = X_i_final,
+        vcov.type = vc,
+        backcast.values = if (is.null(backcast.initial)) NULL else backcast.initial
+      )
+      cat(sprintf("  fixed order=(%d,%d,%d)\n", order_i[1], order_i[2], order_i[3]))
+    }
+
+    donor_selected_orders[[i]] <- order_i
+    donor_fits[[i]]            <- donor_fit
+
+    # extract coefficient on the post-shock indicator (the donor's ω-jump)
+    if (has_lmtest) {
+      # provide a vcov function to coeftest so robust/ordinary is honored
+      vcov_fun <- function(obj) stats::vcov(obj, vcov.type = vc)
+      ct <- lmtest::coeftest(donor_fit, vcov. = vcov_fun)
+      hit <- grep("post_shock_indicator", rownames(ct), fixed = TRUE)
+      omega_star_hat_vec[i]     <- ct[hit[1L], "Estimate"]
+      if ("Std. Error" %in% colnames(ct)) omega_star_std_err_vec[i] <- ct[hit[1L], "Std. Error"]
+    } else {
+      cf  <- coef(donor_fit)
+      nm  <- names(cf)
+      hit <- grep("post_shock_indicator", nm, fixed = TRUE)
+      stopifnot(length(hit) >= 1L)
+      omega_star_hat_vec[i] <- cf[hit[1L]]
+    }
+  }
+
+  # ========================= DBW weights on (target + donors) ===================================
+  X_for_dbw <- c(list(target_covariates), covariates_series_list)
+  dbw_output <- dbw(
+    X                = X_for_dbw,
+    dbw_indices      = dbw_indices,
+    shock_time_vec   = shock_time_vec,   # includes target as the first entry
+    scale            = dbw_scale,
+    center           = dbw_center,
+    sum_to_1         = TRUE,
+    bounded_below_by = 0,
+    bounded_above_by = 1,
+    normchoice       = "l2",
+    penalty_normchoice = penalty_normchoice,
+    penalty_lambda     = penalty_lambda
+  )
+  w_hat <- as.numeric(dbw_output$opt_params)
+  stopifnot(length(w_hat) == length(omega_star_hat_vec))  # must have one weight per donor
+  omega_star_hat <- sum(w_hat * omega_star_hat_vec)       # combined ω-jump
+
+  # ========================= Target pre-shock model + k-step forecast ============================
+  target_Y   <- Y_series_list[[1L]]
+  target_end <- as.integer(shock_time_vec[1L])            # fit only up to t0
+
+  # xreg for target GARCH-X (optional)
+  target_xreg <- if (is.null(covariate_indices)) NULL else {
+    stopifnot(nrow(target_covariates) >= target_end)
+    as.matrix(target_covariates[1:target_end, covariate_indices, drop = FALSE])
+  }
+
+  # fit target (auto vs fixed)
+  if (is.null(garch_order)) {
+    sel_t <- auto_garchx(
+      y     = target_Y[1:target_end],
+      xreg  = target_xreg,
+      max.p = max.p,
+      max.q = max.q,
+      vcov.type = vc
+    )
+    target_order <- c(sel_t$q, sel_t$p, sel_t$o)
+    fit_target   <- sel_t$fit
+    message(sprintf("[Target] auto-selected order = (%d,%d,%d), BIC=%.2f",
+                    sel_t$q, sel_t$p, sel_t$o, sel_t$bic))
+  } else {
+    target_order <- garch_order
+    fit_target   <- garchx::garchx(
+      y = target_Y[1:target_end],
+      order = target_order,
+      xreg  = target_xreg,
+      vcov.type = vc,
+      backcast.values = if (is.null(backcast.initial)) NULL else backcast.initial
+    )
+    message(sprintf("[Target] fixed order = (%d,%d,%d)",
+                    target_order[1], target_order[2], target_order[3]))
+  }
+
+  # k-step variance forecast from the pre-shock target model
+  raw_pred <- predict(fit_target, n.ahead = k)
+  raw_vec  <- as.numeric(if (is.list(raw_pred)) raw_pred$pred else raw_pred)
+
+  # add synthetic correction from donors
+  adjusted_vec   <- raw_vec + omega_star_hat
+  arithmetic_vec <- raw_vec + mean(omega_star_hat_vec)
+
+  predictions <- list(
+    unadjusted      = raw_vec,
+    adjusted        = adjusted_vec,
+    arithmetic_mean = arithmetic_vec
+  )
+
+  # optional losses if you pass ground truth
+  loss <- if (!is.null(ground_truth_vec)) {
+    list(
+      unadjusted      = sum(QL_loss_function(raw_vec,        ground_truth_vec)),
+      adjusted        = sum(QL_loss_function(adjusted_vec,   ground_truth_vec)),
+      arithmetic_mean = sum(QL_loss_function(arithmetic_vec, ground_truth_vec))
+    )
+  } else NULL
+
+  # metadata for diagnostics / reporting
+  meta <- list(
+    n_donors       = n_donors,
+    shock_time     = shock_time_vec,
+    shock_length   = shock_length_vec,
+    dbw_status     = dbw_output$convergence,
+    weights        = w_hat,
+    omega_vec      = omega_star_hat_vec,
+    omega_se       = omega_star_std_err_vec,
+    combined_omega = omega_star_hat,
+    donor_orders   = donor_selected_orders,
+    target_order   = target_order
+  )
+
+  out <- list(
+    linear_combinations = w_hat,
+    predictions         = predictions,
+    meta                = meta
+  )
+  if (!is.null(loss)) out$loss <- loss
+  if (return_fits) {
+    out$donor_fits <- donor_fits
+    out$target_fit <- fit_target
+  }
+
+  # optional plotting hook (only if a function named plot_maker_garch exists)
+  if (isTRUE(plots) && exists("plot_maker_garch", mode = "function")) {
+    plot_maker_garch(
+      fitted(fit_target),
+      shock_time_labels,
+      shock_time_vec,
+      shock_length_vec,
+      raw_vec,
+      w_hat,
+      omega_star_hat_vec,
+      omega_star_std_err_vec,
+      adjusted_vec,
+      arithmetic_vec,
+      ground_truth_vec
+    )
+  }
+
+  return(out)
+}
+
+```
+## Test the SynthVolForecast function
+### First round of testing-for this moudel without donors
+```{r, message=FALSE, warning=FALSE,echo=FALSE}
+# ---- 依赖 ----
+library(garchx)
+
+# ============ 1) 模拟一条 GJR-GARCH(1,1) 序列（作为 target） ============
+sim_gjr <- function(n=2000, omega=0.02, alpha=0.07, beta=0.80, gamma=0.25) {
+  stopifnot(alpha + beta + 0.5*gamma < 1)
+  z <- rnorm(n); h <- e <- numeric(n)
+  h[1] <- omega/(1 - alpha - beta - 0.5*gamma); e[1] <- sqrt(h[1]) * z[1]
+  for (t in 2:n) {
+    Ineg <- as.numeric(e[t-1] < 0)
+    h[t] <- omega + alpha*e[t-1]^2 + gamma*Ineg*e[t-1]^2 + beta*h[t-1]
+    e[t] <- sqrt(h[t]) * z[t]
+  }
+  list(y = e, h = h)
+}
+
+set.seed(1)
+n   <- 2000
+dat <- sim_gjr(n)
+y   <- dat$y
+h   <- dat$h
+
+# ============ 2) 准备 SynthVolForecast 输入（无 donor） ============
+shock_time   <- 1500
+shock_length <- 1     # 占位
+k            <- 3     # 想测几步就改几步
+
+Y_series_list          <- list(y)          # 只有 target
+covariates_series_list <- list()           # 无 donor
+target_covariates      <- data.frame(const = rep(1, n))  # 不用 xreg 时占位即可
+
+# 对照：真方差 & 实现平方收益（用于 QLIKE）
+true_var_k <- h[(shock_time+1):(shock_time+k)]
+y2_future  <- y[(shock_time+1):(shock_time+k)]^2
+
+# ============ 3) 调用 SynthVolForecast（0-donor 通道会生效） ============
+res_k <- SynthVolForecast(
+  Y_series_list          = Y_series_list,
+  covariates_series_list = covariates_series_list,
+  target_covariates      = target_covariates,
+  shock_time_vec         = c(shock_time),
+  shock_length_vec       = c(shock_length),
+  k                      = k,
+  covariate_indices      = NULL,     # 纯 GARCH
+  max.p = 3, max.q = 3,
+  plots = FALSE
+)
+
+pred_k <- res_k$predictions$unadjusted
+pred_k <- pmax(1e-10, pred_k)  # 非负裁剪，避免极端情况下数值问题
+
+# ============ 4) 指标 + 小图（单一起点 k-step） ============
+mse_k   <- mean((pred_k - true_var_k)^2)
+corr_k  <- suppressWarnings(cor(pred_k, true_var_k))
+qlike_k <- mean(log(pred_k) + y2_future / pred_k)
+
+cat(sprintf("Single-origin %d-step: MSE(true)=%.6f | Corr(true)=%.3f | QLIKE=%.6f\n",
+            k, mse_k, corr_k, qlike_k))
+
+op <- par(no.readonly = TRUE); on.exit(par(op))
+yl <- range(c(true_var_k, pred_k), finite = TRUE)   # 关键：同时覆盖两条线
+plot(seq_len(k), true_var_k, type="l", lwd=2, col="black",
+     main=sprintf("True vs Predicted var (k=%d)", k),
+     xlab="horizon", ylab="variance", ylim = yl)
+lines(seq_len(k), pred_k, lwd=2, lty=2, col="red")
+points(seq_len(k), pred_k, pch=16, col="red")
+legend("topleft", c("true","pred"), col=c("black","red"), lty=c(1,2), lwd=2, bty="n")
+```
+```{r, message=FALSE, warning=FALSE,echo=FALSE}
+# ====== Dependencies ======
+library(garchx)
+library(zoo)
+
+# ====== 1) Simulation: GJR-GARCH(1,1) with an ω-jump ======
+# d_omega > 0 means the constant term ω is increased after t0 (i.e., a level shift in variance)
+sim_gjr_omega_jump <- function(n, t0,
+                               omega = 0.02, d_omega = 0.06,
+                               alpha = 0.07, beta = 0.80, gamma = 0.25,
+                               seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  stopifnot(alpha + beta + 0.5 * gamma < 1)      # stationarity check
+
+  z <- rnorm(n)                                  # i.i.d. N(0,1)
+  h <- e <- numeric(n)
+
+  # Warm start using the unconditional variance under the pre-jump ω
+  h[1] <- omega / (1 - alpha - beta - 0.5 * gamma)
+  e[1] <- sqrt(h[1]) * z[1]
+
+  for (t in 2:n) {
+    # Use ω + d_omega after the shock time; ω otherwise
+    omega_t <- if (t > t0) omega + d_omega else omega
+    Ineg    <- as.numeric(e[t - 1] < 0)          # GJR indicator for negative shocks
+
+    # Conditional variance recursion
+    h[t] <- omega_t +
+            alpha * e[t - 1]^2 +
+            gamma * Ineg * e[t - 1]^2 +
+            beta  * h[t - 1]
+
+    # Return (innovation) with conditional std dev
+    e[t] <- sqrt(h[t]) * z[t]
+  }
+  list(y = e, h = h)                             # y = returns; h = true variance
+}
+
+# ====== 2) DBW-only feature construction from y (no covariates into GARCH) ======
+# These features are used only by DBW to compute donor weights (covariate_indices = NULL below)
+make_dbw_features <- function(y, L = 10) {
+  v2 <- y^2
+
+  # Rolling second moments (partial = TRUE avoids NA prefixes)
+  msq5  <- rollapplyr(v2,  5, mean, partial = TRUE)
+  msq10 <- rollapplyr(v2, 10, mean, partial = TRUE)
+  msq20 <- rollapplyr(v2, 20, mean, partial = TRUE)
+
+  # Rolling volatility
+  vol10 <- rollapplyr(y, 10, sd, partial = TRUE)
+
+  # “Shape expansion” of the most recent L lags of y^2
+  lag_one <- function(x, k) { if (k == 0) x else c(rep(x[1], k), x[1:(length(x) - k)]) }
+  lag_block <- sapply(0:(L - 1), function(k) lag_one(v2, k))
+  colnames(lag_block) <- paste0("v2_lag", 0:(L - 1))
+
+  as.data.frame(cbind(msq5, msq10, msq20, vol10, lag_block))
+}
+
+# ====== 3) Generate target + 3 donors (same t0, different jump sizes) ======
+set.seed(2025)
+n  <- 1600
+t0 <- 1200
+
+# target: medium jump; donors: strong / medium / weak jumps
+tar <- sim_gjr_omega_jump(n, t0, d_omega = 0.06)
+d1  <- sim_gjr_omega_jump(n, t0, d_omega = 0.08)
+d2  <- sim_gjr_omega_jump(n, t0, d_omega = 0.04)
+d3  <- sim_gjr_omega_jump(n, t0, d_omega = 0.02)
+
+Y_series_list <- list(tar$y, d1$y, d2$y, d3$y)
+
+# — Build DBW features for target + donors (used only for weighting) —
+target_covariates      <- make_dbw_features(tar$y, L = 10)
+covariates_series_list <- lapply(Y_series_list[-1], make_dbw_features, L = 10)
+
+# ====== 4) Shock metadata ======
+# Persistent ω-jump: indicator stays 1 from t0+1 to the end of the sample
+permanent_jump <- TRUE
+if (permanent_jump) {
+  shock_time_vec <- rep(as.integer(t0), length(Y_series_list))
+  shock_length_vec <- vapply(
+    Y_series_list,
+    function(y) pmax(1L, as.integer(length(y) - as.integer(t0))),  # run to the end
+    integer(1L)
+  )
+} else {
+  # Transient shock (example): here you could set different finite lengths
+  shock_time_vec <- rep(as.integer(t0), length(Y_series_list))
+  shock_length_vec <- vapply(
+    Y_series_list,
+    function(y) pmax(1L, as.integer(length(y) - as.integer(t0))),  # placeholder
+    integer(1L)
+  )
+}
+
+# ====== 5) Single test wrapper: call SynthVolForecast and compare to truth ======
+run_once <- function(k) {
+  stopifnot(k >= 1, k == as.integer(k))
+
+  # Call your SynthVolForecast:
+  # - Feed DBW with features (no covariates into GARCH; covariate_indices = NULL)
+  # - Use all columns from target_covariates for DBW
+  res <- SynthVolForecast(
+    Y_series_list          = Y_series_list,
+    covariates_series_list = covariates_series_list,     # donor features (for DBW)
+    target_covariates      = target_covariates,          # target features (for DBW)
+    shock_time_vec         = shock_time_vec,
+    shock_length_vec       = shock_length_vec,
+    k                      = k,
+    dbw_indices            = 1:ncol(target_covariates),  # columns used by DBW
+    covariate_indices      = NULL,                       # ⭐ keep GARCH free of xreg
+    max.p = 3, max.q = 3,
+    plots = FALSE
+  )
+
+  # — Compare adjusted prediction vs true variance over k steps after t0 —
+  pred_adj <- as.numeric(res$predictions$adjusted)       # includes synthetic donor correction
+  pred_raw <- as.numeric(res$predictions$unadjusted)     # plain GARCH prediction
+  truev    <- tar$h[(t0 + 1):(t0 + k)]                   # simulated ground truth variance
+
+  # Basic metrics
+  mse_adj  <- mean((pred_adj - truev)^2)
+  mae_adj  <- mean(abs(pred_adj - truev))
+  corr_adj <- if (k > 1) suppressWarnings(cor(pred_adj, truev)) else NA_real_
+
+  # Step-by-step table for quick inspection
+  tab <- data.frame(
+    step            = seq_len(k),
+    true_var        = truev,
+    pred_raw        = pred_raw,
+    pred_adj        = pred_adj,
+    diff_adj        = pred_adj - truev,
+    abs_pct_err_adj = 100 * abs(pred_adj - truev) / truev
+  )
+  tab[] <- lapply(tab, function(x) if (is.numeric(x)) round(x, 6) else x)
+  print(tab, row.names = FALSE)
+
+  cat(sprintf(
+    "\n[k=%d]  MSE(true, adj)=%.6f | MAE=%.6f | Corr=%s\n",
+    k, mse_adj, mae_adj, if (is.na(corr_adj)) "NA" else sprintf("%.3f", corr_adj)
+  ))
+
+  # — Show DBW weights and each donor’s estimated shock effect —
+  cat("weights (w_hat): ", paste(round(res$meta$weights, 3), collapse = ", "), "\n")
+  cat("omega by donor : ", paste(round(res$meta$omega_vec, 3), collapse = ", "), "\n")
+  cat("combined omega : ", round(res$meta$combined_omega, 3), "\n\n")
+
+  # — Mini plot (even k = 1 shows points) —
+  x <- seq_len(k)
+  ylim <- range(c(truev, pred_adj, pred_raw), finite = TRUE)
+  plot(x, truev,
+       type = if (k > 1) "l" else "p", pch = 19,
+       lwd = 2, col = "black",
+       main = sprintf("True vs Predicted variance (k=%d)", k),
+       xlab = "horizon (step)", ylab = "variance",
+       ylim = ylim)
+  lines(x, pred_adj, lwd = 2, col = "red",  lty = 2)
+  if (k == 1) points(x, pred_adj, pch = 17, col = "red",   cex = 1.1)
+  lines(x, pred_raw, lwd = 1, col = "grey40", lty = 3)
+  if (k == 1) points(x, pred_raw, pch = 15, col = "grey40", cex = 1.1)
+  legend("topleft",
+         c("true", "pred (adjusted)", "pred (raw)"),
+         lwd = c(2, 2, 1), lty = c(1, 2, 3),
+         pch = c(19, if (k == 1) 17 else NA, if (k == 1) 15 else NA),
+         col = c("black", "red", "grey40"), bty = "n")
+
+  invisible(list(
+    res     = res,
+    table   = tab,
+    metrics = list(mse = mse_adj, mae = mae_adj, corr = corr_adj)
+  ))
+}
+
+cat("=== ω-jump: single-origin testing (k = 1–2) ===\n")
+res_k1 <- run_once(k = 1)
+res_k2 <- run_once(k = 2)
+
+
+
+```
+## Project Summary: SynthVolForecast Volatility Modeling Module
+
+### 1. Project Objective
+
+Build and validate an automated volatility modeling + forecasting pipeline (GARCH/GARCH-X) as a core submodule of SynthVolForecast. The module delivers pre-shock variance forecasts for a target series and then applies a donor-inferred synthetic shock adjustment to handle large, sudden structural changes in volatility.
+
+---
+
+### 2. Completed Work
+
+#### 2.1 GARCH/GARCH-X Model Development & Automation
+
+-Implemented auto_garchx with:
+
+Grid search over (q, p, o) including symmetric GARCH and GJR (leverage/asymmetry).
+
+Model ranking by BIC (AIC also retained).
+
+Unconditional-variance backcast initialization and optional refit for stability.
+
+Robust/ordinary SEs (vcov.type) for reliable coefficient inference.
+
+Clean handling of xreg (optional; strict checks for shape/NA/Inf).
+
+#### 2.2 SynthVolForecast Integration (Donor-Based Synthetic Adjustment)
+
+For each donor, fit (G)JR-GARCH-X on pre-/post-shock window with a post_shock indicator to estimate donor-specific shock effect (omega_star).
+
+Compute DBW (distance-based weights) from covariate features before the shock to form a convex combination of donor effects.
+
+Produce target forecasts as:
+
+Unadjusted: pre-shock target GARCH k-step variance.
+
+Adjusted: unadjusted + sum(w_i * omega_star_i) (synthetic shock correction).
+
+Support 0-donor fast path (plain GARCH) for baseline validation.
+
+#### 2.3 DBW Weighting (Distance-Based Weighting)
+
+Implemented a flexible optimization over donor weights with:
+
+Simplex constraints (nonnegative, sum-to-one) and optional bounds.
+
+L1/L2 matching losses, optional Ridge (L2) penalty.
+
+Scaling/centering, constant-column removal, optional PCA, and lookback slicing.
+
+Clear diagnostics: convergence state, final loss, and selected weights.
+---
+
+### 3. Usage Guidance (High-Level)
+
+When to use: structural events (policy changes, regime shifts, listings, macro shocks) that likely raise variance persistently (ω-level shifts) or over a known window.
+
+Inputs:
+
+Y_series_list: target + donors (returns or residuals).
+
+target_covariates, covariates_series_list: same columns; used by DBW.
+
+shock_time_vec, shock_length_vec: align across series; permanent jump ⇒ length(y)−t0.
+
+Outputs:
+
+predictions$unadjusted: pure GARCH variance forecast.
+
+predictions$adjusted: donor-weighted shock-adjusted variance.
+
+meta: DBW weights, donor effects, selected orders, diagnostics.
+ 
+
+ 
+ 
