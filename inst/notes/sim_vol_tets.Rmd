@@ -1,6 +1,13 @@
 ---
 title: "sim_vol_tets"
-output: html_document
+author: "Qiyang Wang"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 4
+urlcolor: blue
 ---
 
 ##test for auto
