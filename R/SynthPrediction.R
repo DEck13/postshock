@@ -78,281 +78,320 @@
 #' }
 #'
 #' @export
-SynthPrediction <- function(
-    Y_series_list,
-    covariates_series_list,
-    shock_time_vec,
-    shock_length_vec,
-    k = 1,
-    dbw_scale = TRUE,
-    dbw_center = TRUE,
-    dbw_indices = NULL,
-    princ_comp_input = min(length(shock_time_vec), ncol(covariates_series_list[[1]])),
-    covariate_indices = NULL,
-    geometric_sets = NULL,
-    days_before_shocktime_vec = NULL,
-    arima_order = NULL,
-    seasonal = FALSE,
-    seasonal_order = NULL,
-    seasonal_period = NULL,
-    user_ic_choice = c("aicc","aic","bic")[1],
-    stepwise = TRUE,
-    approximation = TRUE,
-    plots = TRUE,
-    display_ground_truth_choice = FALSE,
-    penalty_lambda = 0,
-    penalty_normchoice = "l1"
+# keep same behavior as your scripts that used `id` symbol:
+id <- base::identity
+
+### SynthPrediction Function
+### Purpose: Synthetic Prediction for Time Series with Shock Analysis
+SynthPrediction <- function(Y_series_list,
+                            covariates_series_list,
+                            shock_time_vec,
+                            shock_length_vec,
+                            k = 1,
+                            dbw_scale = TRUE,
+                            dbw_center = TRUE,
+                            dbw_indices = NULL,
+                            princ_comp_input = min(length(shock_time_vec), ncol(covariates_series_list[[1]])),
+                            covariate_indices = NULL,
+                            geometric_sets = NULL,
+                            days_before_shocktime_vec = NULL,
+                            arima_order = NULL,
+                            seasonal = FALSE,
+                            seasonal_order = NULL,
+                            seasonal_period = NULL,
+                            user_ic_choice = c('aicc','aic','bic')[1],
+                            stepwise = TRUE,
+                            approximation = TRUE,
+                            plots = TRUE,
+                            display_ground_truth_choice = FALSE,
+                            penalty_lambda = 0,
+                            penalty_normchoice = "l1"
 ) {
-  # 0) Basic checks
-  stopifnot(is.list(Y_series_list), length(Y_series_list) >= 2)
-  stopifnot(is.list(covariates_series_list),
-            length(covariates_series_list) == length(Y_series_list))
-  stopifnot(length(shock_time_vec)  == length(Y_series_list))
-  stopifnot(length(shock_length_vec) == length(Y_series_list))
-  
+  ### Function Overview:
   n <- length(Y_series_list) - 1
+  if (is.null(dbw_indices)) dbw_indices <- 1:ncol(covariates_series_list[[1]])
   
-  if (is.null(dbw_indices)) {
-    dbw_indices <- seq_len(ncol(as.matrix(covariates_series_list[[1]])))
-  }
-  
-  # Coerce to xts so index()/lag.xts work consistently
-  to_xts <- function(x) if (xts::is.xts(x)) x else xts::as.xts(x)
-  Y_series_list <- lapply(Y_series_list, to_xts)
-  covariates_series_list <- lapply(covariates_series_list, to_xts)
-  
-  # Resolve shock times to integer indices
-  int_shock_idx <- integer(length(Y_series_list))
-  for (i in seq_along(Y_series_list)) {
-    if (is.numeric(shock_time_vec[i]) && length(shock_time_vec[i]) == 1) {
-      int_shock_idx[i] <- as.integer(shock_time_vec[i])
+  integer_shock_time_vec <- c()
+  integer_shock_time_vec_for_convex_hull_based_optimization <- c()
+  for (i in 1:(n+1)){
+    if (is.character(shock_time_vec[i])) {
+      integer_shock_time_vec[i] <- which(index(Y_series_list[[i]]) == shock_time_vec[i])
+      integer_shock_time_vec_for_convex_hull_based_optimization[i] <- which(index(covariates_series_list[[i]]) == shock_time_vec[i])
     } else {
-      idx <- zoo::index(Y_series_list[[i]])
-      pos <- which(idx == shock_time_vec[i])
-      if (length(pos) != 1)
-        stop("Shock time not found (or not unique) for series ", i, ".")
-      int_shock_idx[i] <- pos
+      integer_shock_time_vec[i] <- shock_time_vec[i]
+      integer_shock_time_vec_for_convex_hull_based_optimization[i] <- shock_time_vec[i]
     }
-    if (int_shock_idx[i] < 2) stop("Shock time must be >= 2 (series=", i, ").")
   }
   
-  # 1) Donor shock effects via (S)ARIMA with an indicator
-  omega_star_hat_vec <- numeric(n)
-  order_of_arima     <- vector("list", n + 1L)
-  
-  for (i in 2:(n + 1L)) {
-    shock_start <- int_shock_idx[i]
-    last_pt     <- shock_start + as.integer(shock_length_vec[i]) - 1L
-    last_pt     <- min(last_pt, NROW(Y_series_list[[i]]))
-    zeros <- rep(0, shock_start - 1L)
-    ones  <- rep(1, last_pt - shock_start + 1L)
-    post_ind <- c(zeros, ones)
+  omega_star_hat_vec <- c()
+  order_of_arima <- list()
+  for (i in 2:(n+1)) {
+    vec_of_zeros <- rep(0, integer_shock_time_vec[i])
+    vec_of_ones <- rep(1, shock_length_vec[i])
+    post_shock_indicator <- c(vec_of_zeros, vec_of_ones)
+    last_shock_point <- integer_shock_time_vec[i] + shock_length_vec[i]
     
     if (is.null(covariate_indices)) {
-      X_i_final <- matrix(post_ind, ncol = 1L)
+      X_i_final <- matrix(post_shock_indicator, ncol = 1L)
+      colnames(X_i_final) <- "post_shock_indicator"
     } else {
-      X_cov <- as.matrix(covariates_series_list[[i]][1:last_pt, covariate_indices, drop = FALSE])
-      X_i_final <- cbind(X_cov, post_ind)
+      X_cov    <- as.matrix(covariates_series_list[[i]][1:last_shock_point, covariate_indices, drop = FALSE])
+      X_i_final <- cbind(X_cov, post_shock_indicator = post_shock_indicator)
       X_i_final <- stats::na.omit(X_i_final)
     }
     
-    y_i <- Y_series_list[[i]][1:last_pt]
+    
+    # —— Fit (S)ARIMA model to donor series i —— 
     
     seasonal_period_i <- seasonal_period
     if (isTRUE(seasonal) && is.null(seasonal_period_i)) {
-      seasonal_period_i <- tryCatch(
-        forecast::findfrequency(as.numeric(y_i)),
-        error = function(e) 4
-      )
+      # Auto‐detect seasonal frequency; if that fails, default to 4
+      seasonal_period_i <- tryCatch({
+        forecast::findfrequency(
+          as.numeric(Y_series_list[[i]][1:last_shock_point])
+        )
+      }, error = function(e) {
+        warning(sprintf(
+          "Donor %d: seasonal auto-detect failed → default = 4", i
+        ))
+        4
+      })
     }
     
+    # ——— Remove any NA rows in X_i_final created by lagging ———
+    if (!is.null(covariate_indices)) {
+      X_i_final <- na.omit(X_i_final)
+    }
+    
+    # ——— Fit a (Seasonal) ARIMA model for donor i ———
+    # Case A: User provided a fixed arima_order
     if (!is.null(arima_order)) {
       if (isTRUE(seasonal) && !is.null(seasonal_order)) {
+        # If seasonal = TRUE and a seasonal_order is given, include the seasonal submodel
         donor_model <- forecast::Arima(
-          y = y_i,
-          order = arima_order,
-          seasonal = list(order = seasonal_order, period = seasonal_period_i),
-          xreg = X_i_final
+          y        = Y_series_list[[i]][1:last_shock_point],
+          order    = arima_order,
+          seasonal = list(order  = seasonal_order, 
+                          period = seasonal_period_i),
+          xreg     = X_i_final
         )
       } else {
+        # Otherwise, do not include any seasonal component
         donor_model <- forecast::Arima(
-          y = y_i,
-          order = arima_order,
+          y        = Y_series_list[[i]][1:last_shock_point],
+          order    = arima_order,
           seasonal = FALSE,
-          xreg = X_i_final
+          xreg     = X_i_final
         )
       }
+      
+      # Case B: Let auto.arima() select the best (seasonal) ARIMA specification
     } else {
       donor_model <- tryCatch(
         forecast::auto.arima(
-          y = y_i,
-          xreg = X_i_final,
-          ic = user_ic_choice,
+          y        = Y_series_list[[i]][1:last_shock_point],
+          xreg     = X_i_final,
+          ic       = user_ic_choice,
           seasonal = seasonal,
           stepwise = stepwise,
           approximation = approximation
         ),
         error = function(e) {
-          warning(sprintf("Donor %d: auto.arima() failed -> fallback to Arima(1,1,1).", i))
-          forecast::Arima(y = y_i, order = c(1,1,1), seasonal = FALSE, xreg = X_i_final)
+          # If auto.arima() fails, fall back to a simple ARIMA(1,1,1) with no seasonal
+          warning(sprintf(
+            "Donor %d: auto.arima() failed → fallback to Arima(1,1,1)", i
+          ))
+          forecast::Arima(
+            y        = Y_series_list[[i]][1:last_shock_point],
+            order    = c(1,1,1),
+            seasonal = FALSE,
+            xreg     = X_i_final
+          )
         }
       )
     }
     
+    # Record the chosen ARIMA parameters and extract the shock coefficient
     order_of_arima[[i]] <- donor_model$arma
-    cf  <- lmtest::coeftest(donor_model)
-    omega_star_hat_vec[i - 1L] <- cf[nrow(cf), "Estimate"]
+    coef_test <- lmtest::coeftest(donor_model)
+    hit <- which(rownames(coef_test) == "post_shock_indicator")
+    if (length(hit) != 1L) stop(sprintf("Series %d: cannot find unique 'post_shock_indicator'.", i))
+    omega_star_hat_vec[i - 1L] <- coef_test[hit, "Estimate"]
+    
   }
   
-  # 2) Donor weights
   if (is.null(covariate_indices)) {
-    w_hat <- rep(1 / n, n)
+    n_donors <- length(Y_series_list) - 1
+    w_hat <- rep(1 / n_donors, n_donors)
     omega_star_hat <- sum(w_hat * omega_star_hat_vec)
-    dbw_status <- NA
+    
   } else {
-    dbw_fit <- dbw(
-      X                  = covariates_series_list,
-      dbw_indices        = dbw_indices,
-      shock_time_vec     = int_shock_idx,
-      scale              = dbw_scale,
-      center             = dbw_center,
-      sum_to_1           = TRUE,
-      bounded_below_by   = 0,
-      bounded_above_by   = 1,
-      Y                  = Y_series_list,
+    dbw_output <- dbw(
+      X = covariates_series_list,
+      dbw_indices = dbw_indices,
+      shock_time_vec = integer_shock_time_vec,
+      scale = TRUE,
+      center = TRUE,
+      sum_to_1 = TRUE,
+      bounded_below_by = 0,
+      bounded_above_by = 1,
+      Y = Y_series_list,
       Y_lookback_indices = NULL,
       X_lookback_indices = rep(list(1), length(dbw_indices)),
-      inputted_transformation = base::identity,
-      penalty_lambda     = penalty_lambda,
+      inputted_transformation = id,
+      penalty_lambda = penalty_lambda,
       penalty_normchoice = penalty_normchoice
     )
-    w_hat <- as.numeric(dbw_fit$opt_params)
-    omega_star_hat <- sum(w_hat * omega_star_hat_vec)
-    dbw_status <- dbw_fit$convergence
+    
+    w_hat <- dbw_output$opt_params
+    omega_star_hat <- as.numeric(w_hat %*% omega_star_hat_vec)
   }
   
-  # 3) Target ARIMA and k-ahead forecast
-  target_pre <- Y_series_list[[1]][1:int_shock_idx[1]]
+  ### Forecast Target Series
+  target_series <- Y_series_list[[1]][1:(integer_shock_time_vec[1])]
+  forecast_horizon <- k
   
+  # Construct covariate matrices for training and forecasting, if applicable
   if (is.null(covariate_indices)) {
     xreg_input  <- NULL
     xreg_future <- NULL
   } else {
-    X_pre  <- as.matrix(covariates_series_list[[1]][1:int_shock_idx[1], covariate_indices, drop = FALSE])
-    X_lag1 <- xts::lag.xts(X_pre, k = 1)
-    xreg_input <- stats::na.omit(X_lag1)
+    # Create lagged training covariate values (lag 1 before shock)
+    X_lagged <- lag.xts(
+      covariates_series_list[[1]][1:integer_shock_time_vec[1], covariate_indices]
+    )
+    xreg_input <- X_lagged
     
-    if (NROW(xreg_input) < NROW(target_pre)) {
-      drop_n <- NROW(target_pre) - NROW(xreg_input)
-      target_pre <- target_pre[-seq_len(drop_n)]
-    }
-    
-    X_last <- X_pre[NROW(X_pre), , drop = FALSE]
-    xreg_future <- matrix(rep(as.numeric(X_last), each = k), nrow = k, byrow = TRUE)
-  }
-  
-  target_seasonal_period <- seasonal_period
-  if (isTRUE(seasonal) && is.null(target_seasonal_period)) {
-    target_seasonal_period <- tryCatch(
-      forecast::findfrequency(as.numeric(target_pre)),
-      error = function(e) 4
+    # For forecasting, repeat the last observed covariate vector 'k' times
+    X_last <- covariates_series_list[[1]][integer_shock_time_vec[1], covariate_indices]
+    xreg_future <- matrix(
+      rep(X_last, forecast_horizon),
+      nrow = forecast_horizon,
+      byrow = TRUE
     )
   }
   
+  # Auto‐detect seasonal period for the target if needed
+  target_seasonal_period <- seasonal_period
+  if (isTRUE(seasonal) && is.null(target_seasonal_period)) {
+    target_seasonal_period <- tryCatch({
+      forecast::findfrequency(as.numeric(target_series))
+    }, error = function(e) {
+      warning("Target: seasonal auto‐detect failed → default = 4")
+      4
+    })
+  }
+  
+  # Fit the ARIMA model for the target series
   if (!is.null(arima_order)) {
     if (isTRUE(seasonal) && !is.null(seasonal_order)) {
+      # Include specified seasonal_order
       target_model <- forecast::Arima(
-        y = target_pre,
-        order = arima_order,
-        seasonal = list(order = seasonal_order, period = target_seasonal_period),
-        xreg = xreg_input
+        y        = target_series,
+        order    = arima_order,
+        seasonal = list(order  = seasonal_order,
+                        period = target_seasonal_period),
+        xreg     = xreg_input
       )
     } else {
+      # No seasonal component
       target_model <- forecast::Arima(
-        y = target_pre,
-        order = arima_order,
+        y        = target_series,
+        order    = arima_order,
         seasonal = FALSE,
-        xreg = xreg_input
+        xreg     = xreg_input
       )
     }
   } else {
+    # Let auto.arima() choose the best model (possibly seasonal)
     target_model <- forecast::auto.arima(
-      y = target_pre,
-      xreg = xreg_input,
-      ic = user_ic_choice,
+      y        = target_series,
+      xreg     = xreg_input,
+      ic       = user_ic_choice,
       seasonal = seasonal,
       stepwise = stepwise,
       approximation = approximation
     )
   }
   
+  # Generate k‐step ahead forecasts (with or without xreg)
   if (is.null(xreg_future)) {
-    fc <- stats::predict(target_model, n.ahead = k)
+    unadjusted_pred <- predict(target_model, n.ahead = forecast_horizon)
   } else {
-    fc <- stats::predict(target_model, n.ahead = k, newxreg = xreg_future)
+    unadjusted_pred <- predict(
+      target_model,
+      n.ahead = forecast_horizon,
+      newxreg = xreg_future
+    )
   }
-  raw_pred        <- as.numeric(fc$pred)
-  adj_pred        <- raw_pred + omega_star_hat
-  arith_mean_pred <- raw_pred + mean(omega_star_hat_vec)
   
+  # Finally, adjust the raw ARIMA forecast by adding the weighted shock effect
+  adjusted_pred <- unadjusted_pred$pred + omega_star_hat
+  
+  # 1. take vectors from objects
+  raw_vec       <- as.numeric(unadjusted_pred$pred)          # ARIMA-only
+  adjusted_vec  <- as.numeric(adjusted_pred)                 # synthetic + shock
+  arithmetic_vec<- raw_vec + mean(omega_star_hat_vec)        # arithmetic mean
+  
+  # 2. build predictionsn sublist
   predictions <- list(
-    unadjusted      = raw_pred,
-    adjusted        = adj_pred,
-    arithmetic_mean = arith_mean_pred
+    unadjusted      = raw_vec,
+    adjusted        = adjusted_vec,
+    arithmetic_mean = arithmetic_vec
   )
   
+  # 3. optional loss sublist
   loss <- NULL
-  if (exists("ground_truth_vec", inherits = TRUE)) {
-    gt <- get("ground_truth_vec", inherits = TRUE)
-    if (is.numeric(gt)) {
-      loss <- list(
-        unadjusted      = sum((raw_pred        - gt)^2),
-        adjusted        = sum((adj_pred        - gt)^2),
-        arithmetic_mean = sum((arith_mean_pred - gt)^2)
-      )
-    }
+  if (exists("ground_truth_vec") && !is.null(ground_truth_vec)) {
+    loss <- list(
+      unadjusted      = sum((raw_vec        - ground_truth_vec)^2),
+      adjusted        = sum((adjusted_vec   - ground_truth_vec)^2),
+      arithmetic_mean = sum((arithmetic_vec - ground_truth_vec)^2)
+    )
   }
   
+  # 4. meta sublist
   meta <- list(
     n_donors       = n,
     shock_time     = shock_time_vec,
     shock_length   = shock_length_vec,
-    dbw_status     = dbw_status,
+    dbw_status     = if (exists("dbw_output")) dbw_output[[2]] else NA,
     weights        = w_hat,
     omega_vec      = omega_star_hat_vec,
     combined_omega = as.numeric(omega_star_hat),
     arima_order    = order_of_arima,
     ic_used        = user_ic_choice
   )
-  
-  out <- list(
-    linear_combinations = w_hat,
-    predictions         = predictions,
-    meta                = meta
-  )
-  if (!is.null(loss)) out$loss <- loss
-  
-  # 5) Optional plot hook (lookup via get0 to avoid NOTE)
-  if (isTRUE(plots)) {
-    f <- get0("plot_maker_synthprediction", mode = "function", inherits = TRUE)
-    if (!is.null(f)) {
-      try(
-        f(
-          Y_series_list,
-          shock_time_vec,
-          int_shock_idx,
-          shock_length_vec,
-          raw_pred,
-          w_hat,
-          omega_star_hat_vec,
-          adj_pred,
-          arith_mean_pred,
-          display_ground_truth = display_ground_truth_choice
-        ),
-        silent = TRUE
-      )
-    }
+  if (exists("omega_star_std_err_hat_vec")) {
+    meta$omega_se <- omega_star_std_err_hat_vec
   }
   
-  out
+  # 5. final output list
+  output_list <- list(
+    linear_combinations = w_hat,
+    predictions         = predictions
+  )
+  if (!is.null(loss)) {
+    output_list$loss <- loss
+  }
+  output_list$meta <- meta
+  
+  # 6. opitional
+  if (plots) {
+    plot_maker_synthprediction(
+      Y_series_list,
+      shock_time_vec,
+      integer_shock_time_vec,
+      shock_length_vec,
+      raw_vec,
+      w_hat,
+      omega_star_hat_vec,
+      adjusted_vec,
+      arithmetic_vec,
+      display_ground_truth = display_ground_truth_choice
+    )
+  }
+  
+  return(output_list)
 }
+
