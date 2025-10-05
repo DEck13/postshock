@@ -35,5 +35,11 @@ information from **donor series**.
 
 ------------------------------------------------------------------------
 
-# install.packages("devtools")
+## Installation
+
+You can install the development version from GitHub with `devtools`:
+
+```r
+#install.packages("devtools")
 devtools::install_github(repo = "DEck13/postshock")
+```
