@@ -35,9 +35,5 @@ information from **donor series**.
 
 ------------------------------------------------------------------------
 
-## Installation
-
-Development version (GitHub):
-
-\`\`\`r \# install.packages(“remotes”)
-remotes::install_github(“YOUR_GH_ACCOUNT/postshock”)
+# install.packages("devtools")
+devtools::install_github(repo = "DEck13/postshock")
