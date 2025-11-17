@@ -1,0 +1,717 @@
+---
+title: "paper_test"
+author: "Qiyang Wang"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 4
+urlcolor: blue
+---
+
+```{r}
+# load packages
+library("data.table")
+library("tidyverse")
+library("tseries")
+library("quantmod")
+library('Rsolnp')
+library('msos')
+library('tikzDevice')
+library('xtable')
+
+# set working directory
+setwd("/Users/wangqiyang/Desktop/postshock-main1/inst")
+
+## Conoco Phillips
+getSymbols('COP', from = "2000-01-01")
+COP <- as.data.frame(COP)
+COP <- COP %>% mutate(Date = rownames(COP))
+
+## S&P 500
+getSymbols('^GSPC', from = "1970-01-01")
+GSPC <- as.data.frame(GSPC)
+GSPC <- GSPC %>% mutate(Date = rownames(GSPC))
+
+## Brent Crude prices
+Brent_Crude <- read.csv("https://pkgstore.datahub.io/core/oil-prices/brent-daily_csv/data/d93216330ab2c27aae3d177b2f0f0921/brent-daily_csv.csv") %>%
+  rename(Oil_Close = Price)
+
+## WTI Crude prices
+WTI_Crude <- read.csv("https://pkgstore.datahub.io/core/oil-prices/wti-daily_csv/data/c414c9d375ec3c8f9d7c276d866fb2a4/wti-daily_csv.csv") %>%
+  rename(WTI_Close = Price)
+
+## Gold Price
+getSymbols('GC=F', from = "2000-01-01")
+gold <- as.data.frame(`GC=F`)
+gold <- na.omit(gold)
+gold <- gold %>% mutate(Date = rownames(gold))
+
+## Dollar Index
+getSymbols('DX-Y.NYB', from = "2000-01-01")
+USD <- as.data.frame(`DX-Y.NYB`)
+USD <- na.omit(USD)
+USD <- USD %>% mutate(Date = rownames(USD))
+
+TB_xts <- getSymbols("^IRX", src = "yahoo", from = "2000-01-01", auto.assign = FALSE)
+TB <- data.frame(
+  Date = as.Date(index(TB_xts)),
+  TB_Close = as.numeric(Cl(TB_xts))   # 收盘列
+)
+
+## Volatility Index
+getSymbols('^VIX', from = "2000-01-01")
+VIX <- as.data.frame(VIX)
+VIX <- na.omit(VIX)
+VIX <- VIX %>% mutate(Date = rownames(VIX))
+
+
+## inflation adjustment
+# === inflation adjustment (works without quantmod/FRED backend) ===
+library(curl)
+
+# 直接下载 CPIAUCSL 的 CSV
+u <- "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL"
+raw <- curl_fetch_memory(u)$content
+cpi <- read.csv(text = rawToChar(raw), stringsAsFactors = FALSE)  # 列：DATE, CPIAUCSL
+
+# 年均 + 2020 基期折算
+library(curl)
+
+# 1) 直接抓 CPIAUCSL（CSV）
+txt <- rawToChar(curl_fetch_memory("https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL")$content)
+cpi <- read.csv(text = txt, stringsAsFactors = FALSE)   # 第1列=日期, 第2列=值
+
+# 2) 按年均 + 2020 基期折算→ inflation_adj(year, dollars_2020)
+inflation_adj <- aggregate(cpi[[2]], list(year = as.integer(substr(cpi[[1]], 1, 4))), mean, na.rm = TRUE)
+names(inflation_adj) <- c("year","cpi")
+inflation_adj <- transform(inflation_adj, dollars_2020 = cpi[year == 2020]/cpi)[, c("year","dollars_2020")]
+
+
+
+
+COP_close  <- COP  %>% dplyr::transmute(Date = as.Date(Date), COP_Close  = COP.Close)
+GSPC_close <- GSPC %>% dplyr::transmute(Date = as.Date(Date), GSPC_Close = GSPC.Close)
+USD_close  <- USD  %>% dplyr::transmute(Date = as.Date(Date), USD_Close  = `DX-Y.NYB.Close`)  # 若改用 DX=F 则写 DX.F.Close
+TB_close   <- TB   %>% dplyr::select(Date, TB_Close)  # 这行就是修正点
+VIX_close  <- VIX  %>% dplyr::transmute(Date = as.Date(Date), VIX_Close = VIX.Close)
+
+
+tom <- list(GSPC_close, WTI_Crude, USD_close, TB_close, VIX_close)
+for (i in 1:length(tom)) {
+  COP_close <- merge(COP_close, tom[[i]])
+}
+
+
+# response
+Y <- COP_close$COP_Close[-1]
+
+# data frame
+COP_close <- data.frame(COP_close[-nrow(COP_close), ], Y)
+
+#### Monday, March 17th, 2008
+
+## March 17th; 1 day nowcast
+
+# shock effect date
+start <- which(COP_close$Date == "2008-03-14")
+start_day_20080317 <- as.numeric(1:nrow(COP_close) == start)
+COP_close <- COP_close %>% mutate(start_day_20080317 = start_day_20080317)
+TS2 <- COP_close[(start - 30):start, ]
+# inflation adjustment
+TS2[, 2:8] <- TS2[, 2:8] * inflation_adj$dollars_2020[inflation_adj$year == 2008] 
+m_COP_3_17 <- lm(Y ~ COP_Close + start_day_20080317 + GSPC_Close + WTI_Close + 
+                   USD_Close + TB_Close, 
+                 data = TS2)
+alpha_3_17 <- summary(m_COP_3_17)$coef[3,1:2] 
+# shock-effects
+alpha_3_17
+
+#### 2008 shock effects
+
+# shock effect date
+start_09_08_08 <- which(COP_close$Date == "2008-09-08")
+start_09_12_08 <- which(COP_close$Date == "2008-09-12")
+start_09_26_08 <- which(COP_close$Date == "2008-09-26")
+# three shocks
+start_day_09_08_08 <- as.numeric(1:nrow(COP_close) %in% start_09_08_08)
+start_day_09_12_08 <- as.numeric(1:nrow(COP_close) %in% start_09_12_08)
+start_day_09_26_08 <- as.numeric(1:nrow(COP_close) %in% start_09_26_08)
+COP_close <- COP_close %>% mutate(start_day_09_08_08 = start_day_09_08_08, 
+                                  start_day_09_12_08 = start_day_09_12_08, 
+                                  start_day_09_26_08 = start_day_09_26_08)
+# time window
+TS3 <- COP_close[which(COP_close$Date == "2008-08-26"):which(COP_close$Date == "2008-09-26"), ]
+# adjust for inflation
+TS3[, 2:8] <- TS3[, 2:8] * inflation_adj$dollars_2020[inflation_adj$year == 2008] 
+# AR(1)
+m_COP_Sept_08 <- lm(Y ~ COP_Close + start_day_09_08_08 + start_day_09_12_08 + 
+                      start_day_09_26_08 + GSPC_Close + WTI_Close + USD_Close + TB_Close, data = TS3)
+alpha_Sept_08 <- summary(m_COP_Sept_08)$coef[3:5,1:2] 
+cov2cor(vcov(m_COP_Sept_08)[3:5, 3:5])
+
+# shock-effects
+alpha_Sept_08
+
+# test independence
+
+# test independence of a sequence of covariance matrices
+lrindcov <- function(cov, cols, v){
+  # cols is the sub-columns (in list) you want to test
+  # est is the sample covariance matrix
+  # v is the degrees of freedom of the sample covariance matrix under H0
+  # test
+  # H0: Sigmaij = 0; HA: Sigmaij != 0
+  
+  # sub sample covariance matrix
+  est <- cov[unlist(cols), unlist(cols)]
+  # multiple sub
+  subest <- lapply(cols, function(x) cov[x, x])
+  # dimensions
+  q <- length(unlist(cols))
+  # dimensions of sub sample covariance matrices
+  qs <- sapply(cols, FUN = function(x) length(x))
+  # calculate test statistics: 2log(LR)
+  teststat <- v * (sum(sapply(subest, 
+                              FUN = function(x) if (length(x) == 1) log(x) else logdet(x))) 
+                   - logdet(est))
+  # output result
+  list(tlogLR = teststat, pvalue = 1 - pchisq(q = teststat, df = prod(qs)))
+}
+
+# not significant => Independence
+lrindcov(vcov(m_COP_Sept_08)[3:5, 3:5], cols = list(1, 2, 3), v = df.residual(m_COP_Sept_08))
+
+xtable(vcov(m_COP_Sept_08)[3:5, 3:5], digits = 3)
+
+#### Thursday, November 27, 2014
+
+# shock effect date
+start <- which(COP_close$Date == "2014-11-26")
+start_day_20141127 <- as.numeric(1:nrow(COP_close) == start)
+COP_close <- COP_close %>% mutate(start_day_20141127 = start_day_20141127)
+# time window
+TS4 <- COP_close[(start - 30):start,]
+# adjust for inflation
+TS4[, 2:8] <- TS4[, 2:8] * inflation_adj$dollars_2020[inflation_adj$year == 2014] 
+# AR(1)
+m_COP_11_27_14 <- lm(Y ~ COP_Close + start_day_20141127 + GSPC_Close + WTI_Close + USD_Close + TB_Close, 
+                     data = TS4)
+alpha_11_27_14 <- summary(m_COP_11_27_14)$coef[3,1:2] 
+# shock-effects
+alpha_11_27_14
+
+
+#### The March 9th, 2020 shock effect:
+
+# shock effect date
+start <- which(COP_close$Date == "2020-03-06")
+start_day_20200309 <- as.numeric(1:nrow(COP_close) == start)
+COP_close <- COP_close %>% mutate(start_day_20200309 = start_day_20200309)
+# time window
+TS1 <- COP_close[(start-30):(start), ]
+
+# shock-effect estimate
+m_COP_03_09_20 <- lm(Y ~ COP_Close + start_day_20200309 + GSPC_Close + WTI_Close + 
+                       USD_Close + TB_Close,  
+                     data = TS1)
+alpha_03_09_20 <- summary(m_COP_03_09_20)$coef[3,1:2]
+# shock-effects
+alpha_03_09_20
+
+
+## Shock effect estimators
+estimates <- rbind(alpha_3_17, alpha_Sept_08, alpha_11_27_14)
+estimates[, 2] <- estimates[, 2] ^ 2
+colnames(estimates) <- c("alpha_hat", "var")
+rownames(estimates) <- c("m2008","s8y2008","s12y2008","s26y2008","y2014")
+
+
+# adjustment estimator
+alpha_adj <- mean(estimates[, 1])
+
+# IVW estimator
+weights <- (1 / estimates[,2]) / sum(1 / estimates[, 2])
+alpha_IVW <- sum(weights * estimates[, 1])
+
+# weighted adjustment estimator
+Tstar.Date <- c("2020-03-05", "2008-03-13", "2008-09-05", "2008-09-11", "2008-09-25",  "2014-11-25")
+Tstar <- sapply(Tstar.Date, function(x) which(COP_close$Date == x))
+# X1
+X1 <- as.matrix(TS1[nrow(TS1), 3:7])
+# X1 <- as.matrix(COP_close[c(Tstar[1], Tstar[1] + 1), c(3, 4)])
+# X0
+X0 <- c()
+for (i in 1:5) {
+  X0[[i]] <- as.matrix(COP_close[Tstar[i + 1] + 1, 3:7])
+}
+
+# SCM
+
+dat <- scale(rbind(X1, do.call('rbind', X0)), center = T, scale = T)
+X1 <- dat[1, , drop = FALSE]
+X0 <- c()
+for (i in 1:5) {
+  X0[[i]] <- dat[i + 1, , drop = FALSE]
+}
+
+# Euclidean metric
+# objective function
+
+scmm <- function(X1, X0) {
+  weightedX0 <- function(W) {
+    # W is a vector of weight of the same length of X0
+    n <- length(W)
+    p <- ncol(X1)
+    XW <- matrix(0, nrow = 1, ncol = p)
+    for (i in 1:n) {
+      XW <- XW + W[i] * X0[[i]]
+    }
+    norm <- as.numeric(crossprod(matrix(X1 - XW)))
+    return(norm)
+  }
+  # constraint for W
+  Wcons <- function(W) sum(W) - 1
+  n <- length(X0)
+  # optimization
+  outs <- solnp(par = rep(1/n, n), fun = weightedX0, eqfun = Wcons, eqB = 0, LB = rep(0, n), UB = rep(1, n))
+  
+  # output weights
+  Wstar <- outs$pars
+  
+  return(Wstar)
+}
+
+# objective function is not 0; the fit may not be good
+Wstar <- scmm(X1 = X1, X0 = X0)
+
+weightedX0 <- function(W) {
+  # W is a vector of weight of the same length of X0
+  n <- length(W)
+  p <- ncol(X1)
+  XW <- matrix(0, nrow = 1, ncol = p)
+  for (i in 1:n) {
+    XW <- XW + W[i] * X0[[i]]
+  }
+  norm <- as.numeric(crossprod(matrix(X1 - XW)))
+  return(norm)
+}
+# constraint for W
+Wcons <- function(W) sum(W) - 1
+n <- length(X0)
+# optimization
+outs <- solnp(par = rep(1/n, n), fun = weightedX0, eqfun = Wcons, eqB = 0, LB = rep(0, n), UB = rep(1, n))
+
+# output weights
+Wstar <- outs$pars
+weightedX0(round(outs$pars, digits = 3))
+
+ 
+
+ 
+```
+
+```{r}
+devtools::load_all(".")
+library(postshock)
+```
+```{r}
+# make_window():
+#   - center_date: date of the shock (e.g. "2008-03-17")
+#   - pre:   number of days before the shock to include in the window
+#   - post:  number of days after (including the shock day as the first post day)
+#   - year_adj: calendar year used for CPI-based inflation adjustment
+make_window <- function(center_date, pre = 30, post = 30, year_adj) {
+  # Locate the index of the shock date in COP_close
+  idx_c <- which(COP_close$Date == center_date)
+  if (length(idx_c) != 1) {
+    stop("Date not found or found more than once: ", center_date)
+  }
+  
+  # Compute start and end row indices of the window
+  idx_start <- idx_c - pre
+  idx_end   <- idx_c + post - 1
+  
+  # Subset COP_close to obtain the time window
+  TS <- COP_close[idx_start:idx_end, ]
+  
+  # Inflation adjustment:
+  # assume columns 2:7 are the six price / covariate columns to be scaled
+  factor <- inflation_adj$dollars_2020[inflation_adj$year == year_adj]
+  TS[, 2:7] <- TS[, 2:7] * factor
+  
+  # Return the inflation-adjusted time window
+  return(TS)
+}
+
+
+```
+
+```{r}
+## ================== Build target and donor windows ==================
+
+# Target window around 2020-03-09 (COVID + oil price war episode)
+# pre = 30, post = 30 → 30 days before the shock + shock day + 29 days after
+TS_target <- make_window("2020-03-09", pre = 30, post = 30, year_adj = 2020)
+
+# Donor 1: 2008-03-17 (March 2008 financial crisis shock)
+TS_2008_03_17 <- make_window("2008-03-17", pre = 30, post = 30, year_adj = 2008)
+
+# Donor 2: 2014-11-28 (OPEC supply shock episode)
+TS_2014_11_28 <- make_window("2014-11-28", pre = 30, post = 30, year_adj = 2014)
+
+# Donor 3: 2008-09-09 (first September 2008 shock around the Lehman crisis)
+TS_2008_09_09 <- make_window("2008-09-09", pre = 30, post = 30, year_adj = 2008)
+
+# Donor 4: 2008-09-15 (Lehman Brothers bankruptcy filing date)
+TS_2008_09_15 <- make_window("2008-09-15", pre = 30, post = 30, year_adj = 2008)
+
+# Donor 5: 2008-09-29 (first rejection of the U.S. bailout plan; another large drop)
+TS_2008_09_29 <- make_window("2008-09-29", pre = 30, post = 30, year_adj = 2008)
+
+## ================== Quick sanity check ==================
+
+print(TS_target)       # target window
+print(TS_2008_03_17)   # donor 1
+print(TS_2014_11_28)   # donor 2
+print(TS_2008_09_09)   # donor 3
+print(TS_2008_09_15)   # donor 4
+print(TS_2008_09_29)   # donor 5
+
+
+```
+
+```{r}
+lapply(
+  list(TS_target, TS_2008_03_17, TS_2014_11_28, TS_2008_09_09, TS_2008_09_15, TS_2008_09_29),
+  function(ts) ts[c(30, 31), c("Date", "COP_Close")]
+)
+```
+
+```{r}
+## ========== 1) Choose the 5 covariates to use ==========
+covar_names <- c("GSPC_Close", "WTI_Close", "USD_Close", "TB_Close", "VIX_Close")
+
+## ========== 2) Build Y_series_list (target + 5 donors) ==========
+# Each element is a univariate time series of COP closing prices
+Y_series_list <- list(
+  Y_target      = TS_target$COP_Close,      # target series: 2020-03-09 window
+  Y_2008_03_17  = TS_2008_03_17$COP_Close,  # donor: 2008-03-17 shock
+  Y_2014_11_28  = TS_2014_11_28$COP_Close,  # donor: 2014-11-28 shock
+  Y_2008_09_09  = TS_2008_09_09$COP_Close,  # donor: 2008-09-09 shock
+  Y_2008_09_15  = TS_2008_09_15$COP_Close,  # donor: 2008-09-15 shock
+  Y_2008_09_29  = TS_2008_09_29$COP_Close   # donor: 2008-09-29 shock
+)
+
+## ========== 3) Build covariates_series_list (X for dbw and ARIMA xreg) ==========
+# Each element is a matrix of covariates aligned with the corresponding Y series
+covariates_series_list <- list(
+  X_target      = as.matrix(TS_target[,      covar_names]),
+  X_2008_03_17  = as.matrix(TS_2008_03_17[,  covar_names]),
+  X_2014_11_28  = as.matrix(TS_2014_11_28[,  covar_names]),
+  X_2008_09_09  = as.matrix(TS_2008_09_09[,  covar_names]),
+  X_2008_09_15  = as.matrix(TS_2008_09_15[,  covar_names]),
+  X_2008_09_29  = as.matrix(TS_2008_09_29[,  covar_names])
+)
+
+## ========== 4) Specify pre- and post-shock lengths ==========
+# Each window has 30 pre-shock days and 1 post-shock day (shock occurs at T_pre + 1)
+pre_len  <- 30L
+post_len <- 1L
+
+# shock_time_vec: index of the last pre-shock observation in each series
+shock_time_vec   <- rep(pre_len,  length(Y_series_list))   # all 30
+
+# shock_length_vec: number of post-shock points used to estimate the shock effect
+shock_length_vec <- rep(post_len, length(Y_series_list))   # all 1
+
+## ========== 5) Quick sanity checks ==========
+sapply(Y_series_list, length)  # should all be 60 (30 pre + 30 post)
+shock_time_vec                 # all equal to 30
+shock_length_vec               # all equal to 1
+
+
+```
+```{r}
+library(postshock)
+
+set.seed(2025)
+
+out <- SynthPrediction(
+  Y_series_list          = Y_series_list,
+  covariates_series_list = covariates_series_list,
+  shock_time_vec         = shock_time_vec,
+  shock_length_vec       = shock_length_vec,
+  k                      = 1,      # forecast only the first post-shock day
+  covariate_indices      = 1:5,    # use the 5 covariates as xreg
+  use_dbw                = TRUE,   # use dbw donor-balancing weights
+  dbw_scale              = TRUE,   # scale covariates inside dbw
+  dbw_center             = TRUE,   # center covariates inside dbw
+  seasonal               = FALSE,  # turn OFF seasonality for these short windows
+  plots                  = FALSE   # do not produce plots inside the function
+)
+
+# Donor weights
+out$linear_combinations      
+
+# Shock-effect estimates (one omega for each donor)
+out$meta$omega_vec           
+
+# Forecasts: unadjusted / adjusted / arithmetic mean
+out$predictions              
+
+# Full meta information (weights, omega_vec, combined_omega, ARIMA orders, etc.)
+out$meta
+
+```
+
+
+```{r}
+## Extract the donor's closing price series (COP as donor)
+y_donor <- TS_2008_09_29$COP_Close
+
+Tpre <- 30L          # number of pre-shock observations
+Ls   <- 1L           # length of the shock window (1 day)
+last <- Tpre + Ls    # total number of points used (30 pre + 1 post = 31)
+
+## Use only the first 31 points: 30 pre-shock + 1 post-shock
+y_fit <- y_donor[1:last]
+
+## Post-shock dummy: 0 for the first 30 days, 1 for the 31st day (2008-09-29)
+D <- c(rep(0, Tpre), rep(1, Ls))
+
+## Check the last few observations of y and the dummy
+tail(cbind(y_fit, D), 5)
+
+## Simple OLS regression of y on the post-shock dummy
+m_ols <- lm(y_fit ~ D)
+summary(m_ols)$coef
+
+library(forecast)
+library(lmtest)
+
+## AR(1) model with the post-shock dummy as an exogenous regressor
+m_ar1 <- Arima(y_fit, order = c(1, 0, 0), xreg = D)
+coeftest(m_ar1)
+
+## Use the covariate names defined earlier
+# covar_names <- c("GSPC_Close", "WTI_Close", "USD_Close", "TB_Close", "VIX_Close")
+
+## Build the covariate matrix for the same 31-day window
+X_cov <- as.matrix(TS_2008_09_29[1:last, covar_names])
+
+## As in SynthPrediction: covariates + post-shock dummy as xreg
+X_for_arima <- cbind(X_cov, D)
+
+## Automatic ARIMA selection with exogenous regressors (covariates + dummy)
+## - AICc as the information criterion
+## - Seasonal component allowed (following your package default)
+## - Stepwise + approximation to speed up the search
+m_auto <- auto.arima(
+  y_fit,
+  xreg          = X_for_arima,
+  ic            = "aicc",
+  seasonal      = TRUE,   # same as the default in your package
+  stepwise      = TRUE,
+  approximation = TRUE
+)
+
+## Robust coefficient tests for the selected ARIMA model
+coeftest(m_auto)
+
+```
+
+```{r}
+# GSPC_Close is the 1st column in covar_names, WTI_Close is the 2nd
+covariate_indices <- c(1, 2)
+
+out <- SynthPrediction(
+  Y_series_list          = Y_series_list,          # list of outcome series (target + donors)
+  covariates_series_list = covariates_series_list, # list of corresponding covariate series
+  shock_time_vec         = shock_time_vec,         # vector of shock dates (per series)
+  shock_length_vec       = shock_length_vec,       # vector of shock window lengths
+  k                      = 1,                      # forecast horizon: predict 1 day after the shock
+  covariate_indices      = NULL,                   # use all available covariates (no sub-selection)
+  use_dbw                = TRUE,                   # use donor balancing weights (DBW)
+  seasonal               = TRUE,                   # allow seasonal ARIMA structure (as in package default)
+  plots                  = FALSE                   # do not produce plots in this call
+)
+
+out$linear_combinations    # synthetic control donor weights (for the target series)
+out$meta$omega_vec         # estimated shock effects for each donor
+out$predictions            # list of unadjusted / adjusted / arithmetic_mean forecasts
+
+
+```
+
+
+```{r}
+## ================== 1) Choose covariates (same as prof's alpha setup, exclude VIX) ==================
+covar_names <- c("GSPC_Close", "WTI_Close", "USD_Close", "TB_Close")
+
+## ================== 2) Build Y_series_list: 1 target + 5 donors ==================
+## Here we assume that, as in the professor’s code, each TS_xxxx window
+## has already been cropped to “30 pre + 1 shock” and converted to 2020 dollars
+## (i.e., multiplied by dollars_2020).
+
+Y_series_list <- list(
+  Y_target      = TS_target$COP_Close,      # target series: 2020-03-09 window
+  Y_2008_03_17  = TS_2008_03_17$COP_Close,  # donor: 2008-03-17 shock
+  Y_2014_11_28  = TS_2014_11_28$COP_Close,  # donor: 2014-11-28 shock
+  Y_2008_09_09  = TS_2008_09_09$COP_Close,  # donor: 2008-09-09 shock
+  Y_2008_09_15  = TS_2008_09_15$COP_Close,  # donor: 2008-09-15 shock
+  Y_2008_09_29  = TS_2008_09_29$COP_Close   # donor: 2008-09-29 shock
+)
+
+## ========== 3) Build covariates_series_list (X for dbw and ARIMA xreg) ==========
+# Each element is a matrix of covariates aligned with the corresponding Y series
+covariates_series_list <- list(
+  X_target      = as.matrix(TS_target[,      covar_names]),
+  X_2008_03_17  = as.matrix(TS_2008_03_17[,  covar_names]),
+  X_2014_11_28  = as.matrix(TS_2014_11_28[,  covar_names]),
+  X_2008_09_09  = as.matrix(TS_2008_09_09[,  covar_names]),
+  X_2008_09_15  = as.matrix(TS_2008_09_15[,  covar_names]),
+  X_2008_09_29  = as.matrix(TS_2008_09_29[,  covar_names])
+)
+
+## Each window: 30 pre + 1 post (shock only occurs at time T_pre + 1)
+pre_len  <- 30L
+post_len <- 1L
+
+shock_time_vec   <- rep(pre_len,  length(Y_series_list))   # T_pre = 30 for all series
+shock_length_vec <- rep(post_len, length(Y_series_list))   # L_s  = 1 for all series
+
+## ===================================================================
+## 4) Version A: exact analogue of the paper’s “adjustment estimator” α̂_adj
+##    —— donors are equally weighted; ARIMA(1,0,0)+X, i.e., AR(1)+X
+## ===================================================================
+
+out_adj <- SynthPrediction(
+  Y_series_list          = Y_series_list,           # target + donors’ outcome series
+  covariates_series_list = covariates_series_list,  # corresponding covariate series
+  shock_time_vec         = shock_time_vec,          # shock time (T_pre) for each series
+  shock_length_vec       = shock_length_vec,        # shock length (L_s) for each series
+  k                      = 1,                       # predict only the first point after the shock
+  dbw_scale              = TRUE,                    # scaling option for DBW (irrelevant when use_dbw = FALSE)
+  dbw_center             = TRUE,                    # centering option for DBW (irrelevant when use_dbw = FALSE)
+  dbw_indices            = NULL,                    # indices for DBW (not used here)
+  use_dbw                = FALSE,                   # **key**: equal donor weights -> matches paper’s α̂_adj
+  covariate_indices      = 1:4,                     # use all 4 covariates in X
+  arima_order            = c(1, 0, 0),              # fix ARIMA to AR(1) with no differencing/MA
+  seasonal               = FALSE,                   # no seasonal component (as in the paper)
+  plots                  = FALSE                    # no plots in this run
+)
+
+## Extract quantities corresponding to the paper’s notation
+alpha_hat_i   <- out_adj$meta$omega_vec        # α̂_i: estimated shock effect for each donor i
+alpha_adj_hat <- out_adj$meta$combined_omega   # α̂_adj: average of α̂_i (equal-weight adjustment)
+weights_equal <- out_adj$linear_combinations   # donor weights W: should be (1/5, ..., 1/5)
+
+alpha_hat_i
+alpha_adj_hat
+
+## ===================================================================
+## 6) Version B: DBW-based “weighted adjustment”, analogous to α̂_wadj
+##    (the weighting rule is different from the paper, but plays the same role)
+## ===================================================================
+
+out_dbw <- SynthPrediction(
+  Y_series_list          = Y_series_list,
+  covariates_series_list = covariates_series_list,
+  shock_time_vec         = shock_time_vec,
+  shock_length_vec       = shock_length_vec,
+  k                      = 1,                       # same 1-step-ahead prediction
+  dbw_scale              = TRUE,                    # standardize covariates before DBW
+  dbw_center             = TRUE,                    # center covariates before DBW
+  dbw_indices            = NULL,                    # let DBW automatically choose columns based on pre-shock variance
+  use_dbw                = TRUE,                    # **key**: turn DBW on to get data-driven donor weights
+  covariate_indices      = 1:4,                     # still use all 4 covariates in X
+  arima_order            = c(1, 0, 0),              # still AR(1) + X for each series
+  seasonal               = FALSE,                   # no seasonal component
+  plots                  = FALSE
+)
+
+alpha_hat_i_dbw <- out_dbw$meta$omega_vec        # same α̂_i for each donor as above
+alpha_wadj_dbw  <- out_dbw$meta$combined_omega   # DBW-weighted aggregate shock effect (α̂_wadj analogue)
+weights_dbw     <- out_dbw$linear_combinations   # Ŵ from DBW: data-driven donor weights
+
+alpha_hat_i_dbw
+weights_dbw
+alpha_wadj_dbw
+
+## Predicted outcomes: with and without shock adjustment
+adjusted_preds   <- out_dbw$predictions$adjusted      # forecasts after applying the DBW-based shock adjustment
+unadjusted_preds <- out_dbw$predictions$unadjusted    # raw AR(1)+X forecasts without shock adjustment
+
+adjusted_preds
+unadjusted_preds
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+ 
