@@ -1,0 +1,130 @@
+---
+title: "simapple"
+author: "Qiyang Wang"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+```{r}
+library(tidyverse)
+library(lubridate)
+if (requireNamespace("devtools", quietly = TRUE)) {
+  devtools::load_all("..")  
+} else {
+  library(postshock)
+}
+```
+
+```{r, message=FALSE, warning=FALSE}
+ local({
+  suppressPackageStartupMessages(library(xts))
+
+  set.seed(456)
+
+  gt_n <- 220L
+  gt_dates <- seq.Date(from = as.Date("2021-01-01"), by = "day", length.out = gt_n)
+
+  # Random-walk around 100 (same scale as typical ARIMA level forecasts)
+  gt_y0 <- cumsum(rnorm(gt_n, 0, 1)) + 100
+
+  # Confounder window (control should remove it)
+  gt_t_conf   <- 120L
+  gt_len_conf <- 8L
+  gt_amp_conf <- +6
+  gt_y0[gt_t_conf:(gt_t_conf + gt_len_conf - 1)] <-
+    gt_y0[gt_t_conf:(gt_t_conf + gt_len_conf - 1)] + gt_amp_conf
+
+  # Main shock affects t_main+1 (k=1 predicts this point)
+  gt_t_main   <- 150L
+  gt_amp_main <- +10
+  gt_y0[gt_t_main + 1] <- gt_y0[gt_t_main + 1] + gt_amp_main
+
+  gt_Y0 <- xts::xts(gt_y0, order.by = gt_dates)
+
+  # donors: remove confounder effect so they help explain it away
+  gt_conf_mask <- seq_len(gt_n) %in% gt_t_conf:(gt_t_conf + gt_len_conf - 1)
+  gt_y1 <- (gt_y0 - ifelse(gt_conf_mask, gt_amp_conf, 0)) + rnorm(gt_n, 0, 0.3)
+  gt_y2 <- (gt_y0 - ifelse(gt_conf_mask, gt_amp_conf, 0)) + rnorm(gt_n, 0, 1.0)
+
+  gt_Y1 <- xts::xts(gt_y1, order.by = gt_dates)
+  gt_Y2 <- xts::xts(gt_y2, order.by = gt_dates)
+  gt_Y_series_list <- list(gt_Y0, gt_Y1, gt_Y2)
+
+  # covariates (1 col per series)
+  gt_x_base <- cumsum(rnorm(gt_n, 0, 1))
+  gt_X0 <- xts::xts(gt_x_base + rnorm(gt_n, 0, 0.2), order.by = gt_dates)
+  gt_X1 <- xts::xts(gt_x_base + rnorm(gt_n, 0, 0.2), order.by = gt_dates)
+  gt_X2 <- xts::xts(0.4 * gt_x_base + rnorm(gt_n, 0, 1.0), order.by = gt_dates)
+  gt_covariates_series_list <- list(gt_X0, gt_X1, gt_X2)
+
+  gt_shock_time_vec   <- c(gt_t_main, gt_t_main, gt_t_main)
+  gt_shock_length_vec <- c(1L, 1L, 1L)
+  gt_k <- 1L
+
+  # control only on target
+  gt_control_shocks <- vector("list", length(gt_Y_series_list))
+  gt_control_shocks[[1]] <- list(list(time = gt_t_conf, length = gt_len_conf, shape = "window"))
+
+  gt_truth <- as.numeric(gt_Y0[gt_t_main + 1])
+  stopifnot(is.finite(gt_truth))
+
+  take_k1 <- function(v) {
+    v <- as.numeric(v)
+    stopifnot(length(v) >= 1L, !anyNA(v), all(is.finite(v)))
+    v[1]
+  }
+
+  gt_res_no <- suppressWarnings(
+    SynthPrediction(
+      Y_series_list = gt_Y_series_list,
+      covariates_series_list = gt_covariates_series_list,
+      shock_time_vec = gt_shock_time_vec,
+      shock_length_vec = gt_shock_length_vec,
+      k = gt_k,
+      covariate_indices = 1,
+      seasonal = FALSE,
+      plots = FALSE,
+      use_dbw = TRUE
+    )
+  )
+
+  gt_res_ctl <- suppressWarnings(
+    SynthPrediction(
+      Y_series_list = gt_Y_series_list,
+      covariates_series_list = gt_covariates_series_list,
+      shock_time_vec = gt_shock_time_vec,
+      shock_length_vec = gt_shock_length_vec,
+      k = gt_k,
+      covariate_indices = 1,
+      control_shocks = gt_control_shocks,
+      seasonal = FALSE,
+      plots = FALSE,
+      use_dbw = TRUE
+    )
+  )
+
+  no_unadj  <- take_k1(gt_res_no$predictions$unadjusted)
+  no_adj    <- take_k1(gt_res_no$predictions$adjusted)
+  ctl_unadj <- take_k1(gt_res_ctl$predictions$unadjusted)
+  ctl_adj   <- take_k1(gt_res_ctl$predictions$adjusted)
+
+  err_no_unadj  <- abs(no_unadj  - gt_truth)
+  err_no_adj    <- abs(no_adj    - gt_truth)
+  err_ctl_unadj <- abs(ctl_unadj - gt_truth)
+  err_ctl_adj   <- abs(ctl_adj   - gt_truth)
+
+  cat("\n================= [SynthPrediction] 1-step Ground Truth =================\n")
+  cat("t_main =", gt_t_main, "(predicting t_main+1)\n")
+  cat("Truth  =", round(gt_truth, 6), "\n\n")
+  cat("NO CONTROL:\n")
+  cat("  unadjusted =", round(no_unadj, 6),  "| abs err =", round(err_no_unadj, 6), "\n")
+  cat("  adjusted   =", round(no_adj, 6),    "| abs err =", round(err_no_adj, 6),   "\n\n")
+  cat("WITH CONTROL:\n")
+  cat("  unadjusted =", round(ctl_unadj, 6), "| abs err =", round(err_ctl_unadj, 6), "\n")
+  cat("  adjusted   =", round(ctl_adj, 6),   "| abs err =", round(err_ctl_adj, 6),   "\n")
+  cat("==========================================================================\n\n")
+
+  # soft sanity (not too strict)
+  stopifnot(err_ctl_adj <= 5 * err_no_adj + 1e-8)
+})
+
+```
